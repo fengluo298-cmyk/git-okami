@@ -1,0 +1,21 @@
+{
+  "expo": {
+    "name": "Holdem MVP",
+    "slug": "holdem-mvp",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "assetBundlePatterns": [
+      "**/*"
+    ],
+    "ios": {
+      "supportsTablet": false
+    },
+    "android": {
+      "package": "com.example.texaspoker",
+      "permissions": [
+        "RECORD_AUDIO"
+      ]
+    }
+  }
+}

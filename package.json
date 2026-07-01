@@ -1,0 +1,14 @@
+{
+  "name": "texas-holdem-mobile",
+  "private": true,
+  "workspaces": [
+    "server",
+    "mobile"
+  ],
+  "scripts": {
+    "dev:server": "npm --workspace server run dev",
+    "dev:mobile": "npm --workspace mobile run start",
+    "test": "npm --workspace server test",
+    "typecheck": "npm --workspace server run typecheck && npm --workspace mobile run typecheck"
+  }
+}
