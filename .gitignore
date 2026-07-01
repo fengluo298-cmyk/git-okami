@@ -1,7 +1,30 @@
 node_modules/
 dist/
 .expo/
-.env
 *.db
 *.db-shm
 *.db-wal
+
+# Keep real local secrets out; the checked-in .env.* files are placeholders.
+.env
+
+# Python caches and virtual environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Local/editor files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Generated outputs and heavy local artifacts
+outputs/
+checkpoints/
+*.ckpt
+*.pth
+*.pt
+*.ply
