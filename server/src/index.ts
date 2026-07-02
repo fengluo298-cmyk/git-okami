@@ -6,6 +6,8 @@ import { RoomStore, type Room, type RoomRules } from "./roomStore.js";
 import type { PlayerAction } from "./game/gameEngine.js";
 
 const port = Number(process.env.PORT ?? 4000);
+const corsOrigin = process.env.CORS_ORIGIN ?? "*";
+const socketCorsOrigin = process.env.SOCKET_CORS_ORIGIN ?? corsOrigin;
 const db = new AppDatabase();
 const rooms = new RoomStore(db);
 const actionTimers = new Map<string, NodeJS.Timeout>();
@@ -26,7 +28,7 @@ const httpServer = createServer(async (req, res) => {
 });
 
 const io = new Server(httpServer, {
-  cors: { origin: "*" },
+  cors: { origin: socketCorsOrigin },
   connectionStateRecovery: {
     maxDisconnectionDuration: 120_000
   }
@@ -240,7 +242,7 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
 }
 
 function setCors(res: ServerResponse): void {
-  res.setHeader("access-control-allow-origin", "*");
+  res.setHeader("access-control-allow-origin", corsOrigin);
   res.setHeader("access-control-allow-methods", "GET,POST,OPTIONS");
   res.setHeader("access-control-allow-headers", "content-type,authorization");
 }

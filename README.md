@@ -74,6 +74,38 @@ Socket.IO requires:
 auth: { token: "JWT" }
 ```
 
+## Render Deploy
+
+This repo includes `render.yaml`. On Render use:
+
+```text
+Build Command: npm ci
+Start Command: npm start
+Node: 24.x
+```
+
+Set env vars like this:
+
+```text
+NODE_ENV=production
+JWT_SECRET=<long-random-secret>
+DATABASE_URL=/tmp/holdem.db
+CORS_ORIGIN=*
+SOCKET_CORS_ORIGIN=*
+DEFAULT_CHIPS=10000
+DEFAULT_SMALL_BLIND=50
+DEFAULT_BIG_BLIND=100
+DEFAULT_MIN_BUY_IN=1000
+DEFAULT_MAX_BUY_IN=10000
+DEFAULT_MAX_PLAYERS=6
+DEFAULT_ACTION_TIMEOUT_SECONDS=30
+VOICE_PROVIDER=none
+```
+
+Do not set `DATABASE_URL=DATABASE_URL=...`. Do not use a Windows path such as `E:\Git\...` on Render.
+
+`/tmp/holdem.db` is enough to start the service on Render's free plan, but it is not durable across restarts. Use a paid Render disk with a Linux path like `/var/data/holdem.db`, or migrate to PostgreSQL, when persistent chips matter.
+
 ## Frontend
 
 ```bash

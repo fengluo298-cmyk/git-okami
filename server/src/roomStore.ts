@@ -318,11 +318,11 @@ function nextDealerSeat(players: RoomSeat[], lastDealerSeat: number | null): num
 }
 
 function normalizeRules(rules: Partial<RoomRules>): RoomRules {
-  const smallBlind = positiveInt(rules.smallBlind, 10);
-  const bigBlind = Math.max(positiveInt(rules.bigBlind, 20), smallBlind * 2);
-  const minBuyIn = positiveInt(rules.minBuyIn, 1000);
-  const maxBuyIn = Math.max(positiveInt(rules.maxBuyIn, 10000), minBuyIn);
-  const maxPlayers = Math.min(6, Math.max(2, positiveInt(rules.maxPlayers, 6)));
+  const smallBlind = positiveInt(rules.smallBlind, envInt("DEFAULT_SMALL_BLIND", 10));
+  const bigBlind = Math.max(positiveInt(rules.bigBlind, envInt("DEFAULT_BIG_BLIND", 20)), smallBlind * 2);
+  const minBuyIn = positiveInt(rules.minBuyIn, envInt("DEFAULT_MIN_BUY_IN", 1000));
+  const maxBuyIn = Math.max(positiveInt(rules.maxBuyIn, envInt("DEFAULT_MAX_BUY_IN", 10000)), minBuyIn);
+  const maxPlayers = Math.min(6, Math.max(2, positiveInt(rules.maxPlayers, envInt("DEFAULT_MAX_PLAYERS", 6))));
   return {
     smallBlind,
     bigBlind,
@@ -332,7 +332,7 @@ function normalizeRules(rules: Partial<RoomRules>): RoomRules {
     bettingMode: rules.bettingMode ?? "no_limit",
     minRaise: positiveInt(rules.minRaise, bigBlind),
     maxBetPerRound: rules.maxBetPerRound ? positiveInt(rules.maxBetPerRound, rules.maxBetPerRound) : undefined,
-    actionTimeoutSeconds: positiveInt(rules.actionTimeoutSeconds, 30),
+    actionTimeoutSeconds: positiveInt(rules.actionTimeoutSeconds, envInt("DEFAULT_ACTION_TIMEOUT_SECONDS", 30)),
     allowSpectators: rules.allowSpectators ?? true
   };
 }
@@ -340,4 +340,8 @@ function normalizeRules(rules: Partial<RoomRules>): RoomRules {
 function positiveInt(value: unknown, fallback: number): number {
   const number = Math.floor(Number(value));
   return Number.isFinite(number) && number > 0 ? number : fallback;
+}
+
+function envInt(name: string, fallback: number): number {
+  return positiveInt(process.env[name], fallback);
 }

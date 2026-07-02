@@ -5,9 +5,13 @@
     "server",
     "mobile"
   ],
+  "engines": {
+    "node": ">=24 <25"
+  },
   "scripts": {
     "dev:server": "npm --workspace server run dev",
     "dev:mobile": "npm --workspace mobile run start",
+    "start": "npm --workspace server start",
     "test": "npm --workspace server test",
     "typecheck": "npm --workspace server run typecheck && npm --workspace mobile run typecheck"
   }

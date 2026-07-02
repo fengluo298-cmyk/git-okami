@@ -1,0 +1,34 @@
+services:
+  - type: web
+    name: git-okami
+    runtime: node
+    plan: free
+    buildCommand: npm ci
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        value: /tmp/holdem.db
+      - key: JWT_SECRET
+        sync: false
+      - key: CORS_ORIGIN
+        value: "*"
+      - key: SOCKET_CORS_ORIGIN
+        value: "*"
+      - key: DEFAULT_CHIPS
+        value: "10000"
+      - key: DEFAULT_SMALL_BLIND
+        value: "50"
+      - key: DEFAULT_BIG_BLIND
+        value: "100"
+      - key: DEFAULT_MIN_BUY_IN
+        value: "1000"
+      - key: DEFAULT_MAX_BUY_IN
+        value: "10000"
+      - key: DEFAULT_MAX_PLAYERS
+        value: "6"
+      - key: DEFAULT_ACTION_TIMEOUT_SECONDS
+        value: "30"
+      - key: VOICE_PROVIDER
+        value: none

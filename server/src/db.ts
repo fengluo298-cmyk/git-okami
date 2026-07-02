@@ -24,12 +24,12 @@ export type ChipTransaction = {
   created_at: string;
 };
 
-const DEFAULT_CHIPS = 10000;
+const DEFAULT_CHIPS = positiveInt(process.env.DEFAULT_CHIPS, 10000);
 
 export class AppDatabase {
   private readonly db: DatabaseSync;
 
-  constructor(file = process.env.DATABASE_URL ?? process.env.DB_FILE ?? resolve(process.cwd(), "data", "holdem.db")) {
+  constructor(file = databaseFile()) {
     mkdirSync(dirname(file), { recursive: true });
     this.db = new DatabaseSync(file);
     this.migrate();
@@ -182,4 +182,18 @@ function normalizeUsername(username: string): string {
 
 function stripPassword(user: UserRecord & { passwordHash: string | null }): UserRecord {
   return { id: user.id, username: user.username, nickname: user.nickname, avatar: user.avatar, chips: user.chips };
+}
+
+function databaseFile(): string {
+  let file = process.env.DATABASE_URL ?? process.env.DB_FILE ?? "";
+  while (file.startsWith("DATABASE_URL=")) file = file.slice("DATABASE_URL=".length);
+  if (!file || (process.platform !== "win32" && /^[A-Za-z]:[\\/]/.test(file))) {
+    file = process.env.RENDER ? "/tmp/holdem.db" : resolve(process.cwd(), "data", "holdem.db");
+  }
+  return file;
+}
+
+function positiveInt(value: unknown, fallback: number): number {
+  const number = Math.floor(Number(value));
+  return Number.isFinite(number) && number > 0 ? number : fallback;
 }
