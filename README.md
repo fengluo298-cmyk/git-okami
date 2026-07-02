@@ -192,6 +192,12 @@ eas secret:create --scope project --name EXPO_PUBLIC_API_BASE_URL --value https:
 eas secret:create --scope project --name EXPO_PUBLIC_SOCKET_URL --value https://your-api.example.com
 ```
 
+This repo's `preview` and `production` EAS profiles currently point to:
+
+```text
+https://git-okami.onrender.com
+```
+
 Build APK:
 
 ```bash
