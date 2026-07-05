@@ -20,13 +20,14 @@ const rankLabels: Record<number, string> = {
   13: "K",
   14: "A"
 };
+const suitLabels = { S: "♠", H: "♥", D: "♦", C: "♣" } as const;
 
 export function CardView({ card, hidden = false, small = false }: { card?: Card; hidden?: boolean; small?: boolean }) {
   const red = card?.suit === "H" || card?.suit === "D";
   return (
     <View style={[styles.card, hidden && styles.hidden, small && styles.smallCard]}>
       <Text style={[styles.rank, red && styles.red, small && styles.smallText]}>{hidden || !card ? "?" : rankLabels[card.rank]}</Text>
-      <Text style={[styles.suit, red && styles.red, small && styles.smallText]}>{hidden || !card ? "" : card.suit}</Text>
+      <Text style={[styles.suit, red && styles.red, small && styles.smallText]}>{hidden || !card ? "" : suitLabels[card.suit]}</Text>
     </View>
   );
 }

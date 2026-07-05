@@ -23,6 +23,7 @@ Thumbs.db
 
 # Generated outputs and heavy local artifacts
 outputs/
+output/
 checkpoints/
 *.ckpt
 *.pth
