@@ -213,7 +213,7 @@ adb install path/to/app.apk
 If EAS is not logged in:
 
 ```bash
-npx eas-cli@latest login
+eas login
 npm run build:apk
 ```
 

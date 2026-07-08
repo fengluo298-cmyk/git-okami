@@ -15,6 +15,6 @@
     "test": "npm --workspace server test",
     "typecheck": "npm --workspace server run typecheck && npm --workspace mobile run typecheck",
     "check": "npm test && npm run typecheck",
-    "build:apk": "npx eas-cli@latest build -p android --profile preview"
+    "build:apk": "eas build -p android --profile preview"
   }
 }
