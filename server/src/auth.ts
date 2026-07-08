@@ -29,6 +29,11 @@ export async function login(db: AppDatabase, input: { username?: string; passwor
   return { user: stripPassword(user), token: signToken(user.id) };
 }
 
+export function guestLogin(db: AppDatabase, input: { nickname?: string }): AuthSession {
+  const user = db.getOrCreateGuest(undefined, input.nickname);
+  return { user, token: signToken(user.id) };
+}
+
 export function verifyToken(db: AppDatabase, token?: string): UserRecord {
   const payload = verifyJwt(token);
   const user = db.getUser(String(payload.sub ?? ""));

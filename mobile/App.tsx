@@ -83,6 +83,7 @@ export default function App() {
   const [socketUrl, setSocketUrl] = useState(defaultSocketUrl);
   const [token, setToken] = useState("");
   const [authMode, setAuthMode] = useState<"login" | "register">("login");
+  const [showServerSettings, setShowServerSettings] = useState(false);
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [nickname, setNickname] = useState("");
@@ -124,6 +125,19 @@ export default function App() {
     try {
       const path = authMode === "login" ? "/auth/login" : "/auth/register";
       const result = await api(path, undefined, { username, password, nickname, avatar });
+      await acceptAuth(String(result.token), result.user as User);
+    } catch (error) {
+      showError(error);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function submitGuest() {
+    setBusy(true);
+    setLastError("");
+    try {
+      const result = await api("/auth/guest", undefined, {});
       await acceptAuth(String(result.token), result.user as User);
     } catch (error) {
       showError(error);
@@ -231,10 +245,17 @@ export default function App() {
         <ScrollView contentContainerStyle={styles.connectPanel}>
           <Text style={styles.title}>德州扑克</Text>
           <Text style={styles.caption}>仅使用虚拟筹码</Text>
-          <Text style={styles.label}>接口地址</Text>
-          <TextInput value={apiBase} onChangeText={setApiBase} autoCapitalize="none" autoCorrect={false} style={styles.input} />
-          <Text style={styles.label}>联机地址</Text>
-          <TextInput value={socketUrl} onChangeText={setSocketUrl} autoCapitalize="none" autoCorrect={false} style={styles.input} />
+          <Pressable style={styles.textButton} onPress={() => setShowServerSettings(!showServerSettings)}>
+            <Text style={styles.joinText}>{showServerSettings ? "隐藏服务器设置" : "服务器设置"}</Text>
+          </Pressable>
+          {showServerSettings ? (
+            <>
+              <Text style={styles.label}>接口地址</Text>
+              <TextInput value={apiBase} onChangeText={setApiBase} autoCapitalize="none" autoCorrect={false} style={styles.input} />
+              <Text style={styles.label}>联机地址</Text>
+              <TextInput value={socketUrl} onChangeText={setSocketUrl} autoCapitalize="none" autoCorrect={false} style={styles.input} />
+            </>
+          ) : null}
           <Text style={styles.label}>用户名</Text>
           <TextInput value={username} onChangeText={setUsername} autoCapitalize="none" autoCorrect={false} style={styles.input} />
           <Text style={styles.label}>密码</Text>
@@ -249,6 +270,9 @@ export default function App() {
           ) : null}
           <Pressable style={[styles.primaryButton, busy && styles.disabledButton]} disabled={busy} onPress={submitAuth}>
             <Text style={styles.primaryText}>{authMode === "login" ? "登录" : "创建账号"}</Text>
+          </Pressable>
+          <Pressable style={[styles.ghostButton, busy && styles.disabledButton]} disabled={busy} onPress={submitGuest}>
+            <Text style={styles.ghostText}>游客进入</Text>
           </Pressable>
           <Pressable style={styles.textButton} onPress={() => setAuthMode(authMode === "login" ? "register" : "login")}>
             <Text style={styles.joinText}>{authMode === "login" ? "没有账号？去注册" : "已有账号？去登录"}</Text>

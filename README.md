@@ -201,13 +201,27 @@ https://git-okami.onrender.com
 Build APK:
 
 ```bash
-eas build -p android --profile preview
+npm run build:apk
 ```
 
 Download the APK from the EAS build link, then install:
 
 ```bash
 adb install path/to/app.apk
+```
+
+If EAS is not logged in:
+
+```bash
+npx eas-cli@latest login
+npm run build:apk
+```
+
+On Windows, if EAS reports an `EXDEV` rename error, run it with a local app-data directory:
+
+```powershell
+$env:APPDATA="$PWD/.eas-appdata"
+npm run build:apk
 ```
 
 Android package:

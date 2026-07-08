@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { register, login, verifyToken, isPasswordHash } from "../src/auth.js";
+import { guestLogin, register, login, verifyToken, isPasswordHash } from "../src/auth.js";
 import { AppDatabase } from "../src/db.js";
 import { RoomStore } from "../src/roomStore.js";
 
@@ -19,6 +19,16 @@ test("register stores a bcrypt hash, rejects duplicates, and login returns a val
   assert.equal(verifyToken(db, session.token).id, session.user.id);
   assert.equal((await login(db, { username: "alice", password: "secret1" })).user.id, session.user.id);
   await assert.rejects(() => register(db, { username: "ALICE", password: "secret1", nickname: "Other" }), /already exists/);
+});
+
+test("guest login creates a token-backed virtual chip user", () => {
+  const db = testDb();
+  const session = guestLogin(db, { nickname: "Guest" });
+
+  assert.equal(session.user.username, null);
+  assert.equal(session.user.nickname, "Guest");
+  assert.equal(session.user.chips, 10000);
+  assert.equal(verifyToken(db, session.token).id, session.user.id);
 });
 
 test("buy-in removes bank chips and cash-out restores table chips once", async () => {

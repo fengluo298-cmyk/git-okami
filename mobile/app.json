@@ -12,7 +12,7 @@
       "supportsTablet": false
     },
     "android": {
-      "package": "com.example.texaspoker",
+      "package": "com.fengluo298.gitokami",
       "permissions": [
         "RECORD_AUDIO"
       ]

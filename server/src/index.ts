@@ -1,6 +1,6 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { Server, type Socket } from "socket.io";
-import { login, register, signVoiceToken, verifyToken } from "./auth.js";
+import { guestLogin, login, register, signVoiceToken, verifyToken } from "./auth.js";
 import { AppDatabase, type UserRecord } from "./db.js";
 import { RoomStore, type Room, type RoomRules } from "./roomStore.js";
 import type { PlayerAction } from "./game/gameEngine.js";
@@ -20,6 +20,7 @@ const httpServer = createServer(async (req, res) => {
     if (req.method === "GET" && url.pathname === "/") return sendJson(res, 200, { ok: true, service: "texas-holdem-server" });
     if (req.method === "POST" && url.pathname === "/auth/register") return sendJson(res, 200, { ok: true, ...(await register(db, await readJson(req))) });
     if (req.method === "POST" && url.pathname === "/auth/login") return sendJson(res, 200, { ok: true, ...(await login(db, await readJson(req))) });
+    if (req.method === "POST" && url.pathname === "/auth/guest") return sendJson(res, 200, { ok: true, ...guestLogin(db, await readJson(req)) });
     if (req.method === "GET" && url.pathname === "/auth/me") return sendJson(res, 200, { ok: true, user: verifyToken(db, bearer(req)) });
     return sendJson(res, 404, { ok: false, error: "Not found" });
   } catch (error) {

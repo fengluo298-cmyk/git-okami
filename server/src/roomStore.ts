@@ -73,7 +73,7 @@ export class RoomStore {
     const fullRules = normalizeRules(rules);
     const room: Room = {
       id: randomUUID().slice(0, 8),
-      name: (name ?? "").trim().slice(0, 24) || `${owner.nickname}'s table`,
+      name: (name ?? "").trim().slice(0, 24) || `${owner.nickname}的牌桌`,
       ownerId: owner.id,
       status: "lobby",
       seats: Array.from({ length: fullRules.maxPlayers }, () => null),
