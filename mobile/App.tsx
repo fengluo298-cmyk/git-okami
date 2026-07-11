@@ -75,6 +75,7 @@ type RoomState = {
 type ConnectionStatus = "idle" | "connecting" | "online" | "reconnecting" | "offline";
 
 const tokenKey = "holdem.jwt";
+const clientBuild = 2;
 const defaultSocketUrl = process.env.EXPO_PUBLIC_SOCKET_URL || process.env.EXPO_PUBLIC_SERVER_URL || "http://10.0.2.2:4000";
 const defaultApiBase = process.env.EXPO_PUBLIC_API_BASE_URL || process.env.EXPO_PUBLIC_SERVER_URL || "http://10.0.2.2:4000";
 
@@ -168,7 +169,7 @@ export default function App() {
     setStatus("connecting");
     const next = io(socketUrl.trim(), {
       transports: ["websocket"],
-      auth: { token: nextToken },
+      auth: { token: nextToken, clientBuild },
       reconnection: true,
       reconnectionAttempts: Infinity,
       reconnectionDelay: 500,
@@ -182,7 +183,7 @@ export default function App() {
     });
     next.on("session", setUser);
     next.on("rooms:list", setRooms);
-    next.on("room:state", setRoom);
+    next.on("room:state", (nextRoom: RoomState | null) => setRoom(nextRoom && nextRoom.status !== "playing" ? { ...nextRoom, game: null } : nextRoom));
     next.on("error:message", ({ message }: { message: string }) => Alert.alert("提示", zhMessage(message)));
     next.on("disconnect", (reason) => {
       setStatus(next.active ? "reconnecting" : "offline");
@@ -554,6 +555,7 @@ function handNameLabel(name: string): string {
 }
 
 function zhMessage(message: string): string {
+  if (message === "Client version is no longer supported") return "版本过旧，请安装最新 APK";
   if (message.startsWith("Seat must be ")) return message.replace("Seat must be ", "座位必须是 ");
   if (message.startsWith("Buy-in must be ")) return message.replace("Buy-in must be ", "买入必须是 ");
   if (message.startsWith("Bet cannot exceed ")) return message.replace("Bet cannot exceed ", "下注不能超过 ");

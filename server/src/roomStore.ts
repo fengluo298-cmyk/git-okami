@@ -267,19 +267,23 @@ export class RoomStore {
   }
 
   private syncFinishedHand(room: Room): void {
-    if (!room.engine) return;
-    const handId = room.engine.state.handId;
-    if (room.settledHandIds.has(handId)) return;
-    room.settledHandIds.add(handId);
-    for (const player of room.engine.state.players) {
-      const seat = room.seats[player.seat];
-      if (!seat) continue;
-      const before = seat.handStartChips ?? seat.chips;
-      seat.chips = player.chips;
-      seat.handStartChips = player.chips;
-      const delta = player.chips - before;
-      if (delta !== 0) this.db.logChipTransaction(player.id, delta > 0 ? "win_pot" : "lose_bet", delta, before, player.chips, room.id, handId);
+    const engine = room.engine;
+    if (!engine) return;
+    const handId = engine.state.handId;
+    if (!room.settledHandIds.has(handId)) {
+      room.settledHandIds.add(handId);
+      for (const player of engine.state.players) {
+        const seat = room.seats[player.seat];
+        if (!seat) continue;
+        const before = seat.handStartChips ?? seat.chips;
+        seat.chips = player.chips;
+        seat.handStartChips = player.chips;
+        const delta = player.chips - before;
+        if (delta !== 0) this.db.logChipTransaction(player.id, delta > 0 ? "win_pot" : "lose_bet", delta, before, player.chips, room.id, handId);
+      }
     }
+    room.engine = null;
+    room.status = "lobby";
   }
 
   private cashOutSeat(room: Room, seat: RoomSeat): void {

@@ -1,6 +1,6 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { Server, type Socket } from "socket.io";
-import { guestLogin, login, register, signVoiceToken, verifyToken } from "./auth.js";
+import { guestLogin, login, register, requireClientBuild, signVoiceToken, verifyToken } from "./auth.js";
 import { AppDatabase, type UserRecord } from "./db.js";
 import { RoomStore, type Room, type RoomRules } from "./roomStore.js";
 import type { PlayerAction } from "./game/gameEngine.js";
@@ -8,6 +8,7 @@ import type { PlayerAction } from "./game/gameEngine.js";
 const port = Number(process.env.PORT ?? 4000);
 const corsOrigin = process.env.CORS_ORIGIN ?? "*";
 const socketCorsOrigin = process.env.SOCKET_CORS_ORIGIN ?? corsOrigin;
+const minClientBuild = Number(process.env.MIN_CLIENT_BUILD ?? 2);
 const db = new AppDatabase();
 const rooms = new RoomStore(db);
 const actionTimers = new Map<string, NodeJS.Timeout>();
@@ -37,7 +38,8 @@ const io = new Server(httpServer, {
 
 io.use((socket, next) => {
   try {
-    const auth = socket.handshake.auth as { token?: string };
+    const auth = socket.handshake.auth as { token?: string; clientBuild?: number };
+    requireClientBuild(auth.clientBuild, minClientBuild);
     socket.data.user = verifyToken(db, auth.token);
     next();
   } catch (error) {
@@ -210,6 +212,7 @@ function resumeRoom(socket: Socket, user: UserRecord): void {
 function scheduleRoomTimer(room: Room): void {
   const oldTimer = actionTimers.get(room.id);
   if (oldTimer) clearTimeout(oldTimer);
+  actionTimers.delete(room.id);
   if (room.status !== "playing" || !room.engine || room.engine.state.currentTurnSeat === null) return;
   actionTimers.set(
     room.id,

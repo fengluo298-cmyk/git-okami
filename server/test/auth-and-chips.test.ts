@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { guestLogin, register, login, verifyToken, isPasswordHash } from "../src/auth.js";
+import { guestLogin, register, login, verifyToken, isPasswordHash, requireClientBuild } from "../src/auth.js";
 import { AppDatabase } from "../src/db.js";
 import { RoomStore } from "../src/roomStore.js";
 
@@ -29,6 +29,12 @@ test("guest login creates a token-backed virtual chip user", () => {
   assert.equal(session.user.nickname, "Guest");
   assert.equal(session.user.chips, 10000);
   assert.equal(verifyToken(db, session.token).id, session.user.id);
+});
+
+test("client build gate rejects old app versions", () => {
+  assert.throws(() => requireClientBuild(undefined, 2), /Client version/);
+  assert.throws(() => requireClientBuild(1, 2), /Client version/);
+  assert.doesNotThrow(() => requireClientBuild(2, 2));
 });
 
 test("buy-in removes bank chips and cash-out restores table chips once", async () => {

@@ -49,6 +49,10 @@ export function isPasswordHash(value: string): boolean {
   return value.startsWith("$2");
 }
 
+export function requireClientBuild(value: unknown, minBuild: number): void {
+  if (Number(value ?? 0) < minBuild) throw new Error("Client version is no longer supported");
+}
+
 function signToken(userId: string): string {
   return signJwt({ sub: userId, scope: "access" }, TOKEN_TTL_SECONDS);
 }

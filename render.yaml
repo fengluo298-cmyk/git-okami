@@ -30,5 +30,7 @@ services:
         value: "6"
       - key: DEFAULT_ACTION_TIMEOUT_SECONDS
         value: "30"
+      - key: MIN_CLIENT_BUILD
+        value: "2"
       - key: VOICE_PROVIDER
         value: none
