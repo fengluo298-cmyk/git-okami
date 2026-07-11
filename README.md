@@ -14,9 +14,13 @@ server/
   src/game/*                   # authoritative poker engine
   test/*.test.ts               # auth, chips, betting, side pot, hand tests
 mobile/
-  App.tsx                      # login/register/lobby/table/voice UI
-  app.json                     # Android package and RECORD_AUDIO permission
+  App.tsx                      # login/register/lobby/table UI
+  src/api/client.ts            # API timeout/error classification and URL guard
+  src/auth/*                   # SecureStore token storage with AsyncStorage migration
+  src/utils/*                  # amount parsing and error dedupe
+  app.json                     # Android package/config
   src/components/CardView.tsx
+scripts/check-android-signature.mjs
 eas.json                       # APK preview build profile
 .env.example
 .env.development
@@ -72,6 +76,12 @@ Socket.IO requires:
 
 ```js
 auth: { token: "JWT" }
+```
+
+Current Socket clients must also send `clientBuild >= MIN_CLIENT_BUILD`:
+
+```js
+auth: { token: "JWT", clientBuild: 2 }
 ```
 
 ## Render Deploy
@@ -146,6 +156,7 @@ http://192.168.1.23:4000
 ```bash
 npm test
 npm run typecheck
+npm run check
 ```
 
 Current tests cover:
@@ -160,20 +171,12 @@ Current tests cover:
 - Minimum raise and short all-in.
 - Timeout auto fold/check.
 - Showdown hand ranking and side pots.
+- Mobile token migration, API error classification, amount parsing, error dedupe.
+- Duplicate Socket operation ID handling.
 
 ## Voice
 
-Implemented now:
-
-- Room-bound voice join/leave events.
-- Server checks the logged-in user is in the room.
-- Server issues a short-lived room voice token.
-- Mobile UI requests Android `RECORD_AUDIO`.
-- UI supports voice on/off, mute/unmute, and speaking indicators.
-
-Not implemented yet:
-
-- Real audio streaming. Add LiveKit/Agora/WebRTC native SDK in an Expo Development Build, then exchange the current `voiceToken` for that provider's room token.
+Voice is disabled in the mobile UI. The previous UI only toggled room state and did not capture, transmit, subscribe, or play audio, so the `RECORD_AUDIO` permission was removed. Add LiveKit/Agora/WebRTC in a development build before exposing voice again.
 
 ## APK Build
 
@@ -228,8 +231,43 @@ npm run build:apk
 Android package:
 
 ```text
-com.example.texaspoker
+com.fengluo298.gitokami
 ```
+
+### Local Android Build
+
+Debug APK:
+
+```powershell
+cd E:/Git/texas-holdem-mobile/mobile/android
+$env:JAVA_HOME='C:\Program Files\Microsoft\jdk-17.0.19.10-hotspot'
+$env:ANDROID_HOME='E:\Android\Sdk'
+$env:ANDROID_SDK_ROOT=$env:ANDROID_HOME
+.\gradlew.bat assembleDebug --no-daemon
+```
+
+Release APK/AAB require a real signing key. Do not commit the keystore or passwords.
+
+```powershell
+$env:ANDROID_RELEASE_STORE_FILE='C:\secure\release.keystore'
+$env:ANDROID_RELEASE_STORE_PASSWORD='<secret>'
+$env:ANDROID_RELEASE_KEY_ALIAS='<alias>'
+$env:ANDROID_RELEASE_KEY_PASSWORD='<secret>'
+.\gradlew.bat assembleRelease --no-daemon
+.\gradlew.bat bundleRelease --no-daemon
+```
+
+If those variables are missing, release builds fail instead of using the debug keystore.
+
+Check a signed artifact:
+
+```powershell
+npm run check:android-signature -- mobile/android/app/build/outputs/apk/release/app-release.apk
+```
+
+The check fails when the certificate subject contains `Android Debug`.
+
+Current Android permissions are limited to network access plus AndroidX's app-private dynamic receiver permission. App data backup is disabled so auth tokens in SecureStore are not backed up.
 
 ## Environment
 
@@ -250,12 +288,14 @@ VOICE_APP_ID
 VOICE_APP_SECRET
 EXPO_PUBLIC_API_BASE_URL
 EXPO_PUBLIC_SOCKET_URL
+EXPO_PUBLIC_ALLOWED_HOSTS
+MIN_CLIENT_BUILD
 ```
 
 ## Current Limits
 
 - Rooms are still in memory; restart clears active tables but not users/chip ledger.
-- Real audio transport is not wired yet; only authenticated voice room state/token is implemented.
+- Real audio transport is not wired yet; mobile voice is intentionally disabled.
 - No admin UI.
 - No production Redis/session clustering.
 - No ESLint config existed in the project; `npm run typecheck` is the current static gate.

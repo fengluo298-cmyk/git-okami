@@ -4,6 +4,15 @@ apply plugin: "com.facebook.react"
 
 def mobileProjectRoot = rootDir.getAbsoluteFile().getParentFile().getAbsoluteFile()
 def workspaceRoot = mobileProjectRoot.getParentFile().getAbsoluteFile()
+def releaseStoreFile = findProperty('ANDROID_RELEASE_STORE_FILE') ?: System.getenv('ANDROID_RELEASE_STORE_FILE')
+def releaseStorePassword = findProperty('ANDROID_RELEASE_STORE_PASSWORD') ?: System.getenv('ANDROID_RELEASE_STORE_PASSWORD')
+def releaseKeyAlias = findProperty('ANDROID_RELEASE_KEY_ALIAS') ?: System.getenv('ANDROID_RELEASE_KEY_ALIAS')
+def releaseKeyPassword = findProperty('ANDROID_RELEASE_KEY_PASSWORD') ?: System.getenv('ANDROID_RELEASE_KEY_PASSWORD')
+def releaseSigningReady = releaseStoreFile && releaseStorePassword && releaseKeyAlias && releaseKeyPassword
+def wantsReleaseBuild = gradle.startParameter.taskNames.any { it.toLowerCase().contains("release") }
+if (wantsReleaseBuild && !releaseSigningReady) {
+    throw new GradleException("Release signing is missing. Set ANDROID_RELEASE_STORE_FILE, ANDROID_RELEASE_STORE_PASSWORD, ANDROID_RELEASE_KEY_ALIAS and ANDROID_RELEASE_KEY_PASSWORD.")
+}
 
 /**
  * This is the configuration block to customize your React Native Android app.
@@ -106,15 +115,21 @@ android {
             keyAlias 'androiddebugkey'
             keyPassword 'android'
         }
+        if (releaseSigningReady) {
+            release {
+                storeFile file(releaseStoreFile)
+                storePassword releaseStorePassword
+                keyAlias releaseKeyAlias
+                keyPassword releaseKeyPassword
+            }
+        }
     }
     buildTypes {
         debug {
             signingConfig signingConfigs.debug
         }
         release {
-            // Caution! In production, you need to generate your own keystore file.
-            // see https://reactnative.dev/docs/signed-apk-android.
-            signingConfig signingConfigs.debug
+            if (releaseSigningReady) signingConfig signingConfigs.release
             def enableShrinkResources = findProperty('android.enableShrinkResourcesInReleaseBuilds') ?: 'false'
             shrinkResources enableShrinkResources.toBoolean()
             minifyEnabled enableMinifyInReleaseBuilds

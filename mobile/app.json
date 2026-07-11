@@ -5,18 +5,17 @@
     "version": "1.0.1",
     "orientation": "portrait",
     "userInterfaceStyle": "dark",
-    "assetBundlePatterns": [
-      "**/*"
-    ],
+    "assetBundlePatterns": [],
     "ios": {
       "supportsTablet": false
     },
     "android": {
       "package": "com.fengluo298.gitokami",
       "versionCode": 2,
-      "permissions": [
-        "RECORD_AUDIO"
-      ]
-    }
+      "permissions": []
+    },
+    "plugins": [
+      "expo-secure-store"
+    ]
   }
 }

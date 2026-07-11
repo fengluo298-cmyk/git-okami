@@ -1,10 +1,7 @@
-import AsyncStorage from "@react-native-async-storage/async-storage";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Alert,
   FlatList,
-  PermissionsAndroid,
-  Platform,
   Pressable,
   SafeAreaView,
   ScrollView,
@@ -15,7 +12,11 @@ import {
   View
 } from "react-native";
 import { io, type Socket } from "socket.io-client";
+import { apiRequest, AuthExpiredError, InvalidResponseError, NetworkError, ServerError, TimeoutError, validateHttpBaseUrl, validateSocketUrl } from "./src/api/client";
+import { tokenStorage } from "./src/auth/tokenStorage";
 import { CardView, type Card } from "./src/components/CardView";
+import { ErrorLimiter } from "./src/utils/errorLimiter";
+import { parseChipAmountInRange } from "./src/utils/amount";
 
 type User = { id: string; username: string | null; nickname: string; avatar: string; chips: number };
 type Rules = {
@@ -73,16 +74,20 @@ type RoomState = {
   };
 };
 type ConnectionStatus = "idle" | "connecting" | "online" | "reconnecting" | "offline";
+type AuthState = "unauthenticated" | "authenticating" | "restoring" | "authenticated" | "offline-authenticated" | "logging-out" | "error";
 
-const tokenKey = "holdem.jwt";
 const clientBuild = 2;
 const defaultSocketUrl = process.env.EXPO_PUBLIC_SOCKET_URL || process.env.EXPO_PUBLIC_SERVER_URL || "http://10.0.2.2:4000";
 const defaultApiBase = process.env.EXPO_PUBLIC_API_BASE_URL || process.env.EXPO_PUBLIC_SERVER_URL || "http://10.0.2.2:4000";
+const errorLimiter = new ErrorLimiter();
 
 export default function App() {
+  const mountedRef = useRef(true);
+  const socketRef = useRef<Socket | null>(null);
   const [apiBase, setApiBase] = useState(defaultApiBase);
   const [socketUrl, setSocketUrl] = useState(defaultSocketUrl);
   const [token, setToken] = useState("");
+  const [authState, setAuthState] = useState<AuthState>("restoring");
   const [authMode, setAuthMode] = useState<"login" | "register">("login");
   const [showServerSettings, setShowServerSettings] = useState(false);
   const [username, setUsername] = useState("");
@@ -96,38 +101,75 @@ export default function App() {
   const [rooms, setRooms] = useState<RoomSummary[]>([]);
   const [room, setRoom] = useState<RoomState | null>(null);
   const [busy, setBusy] = useState(false);
+  const [pendingOps, setPendingOps] = useState<Record<string, boolean>>({});
   const [raiseTo, setRaiseTo] = useState("");
   const [buyIn, setBuyIn] = useState("1000");
-  const [voiceToken, setVoiceToken] = useState("");
 
   const mySeat = useMemo(() => room?.seats.find((seat) => seat?.id === user?.id) ?? null, [room, user]);
   const gameSeat = useMemo(() => room?.game?.players.find((seat) => seat.id === user?.id) ?? null, [room, user]);
   const actions = room?.game?.availableActions ?? null;
-  const myVoice = room?.voice.find((voice) => voice.userId === user?.id);
+  const anyPending = useMemo(() => Object.values(pendingOps).some(Boolean), [pendingOps]);
+  const canEditServer = typeof __DEV__ !== "undefined" && __DEV__;
 
   useEffect(() => {
-    AsyncStorage.getItem(tokenKey).then((saved) => {
-      if (saved) restoreSession(saved);
-    });
+    tokenStorage
+      .get()
+      .then((saved) => {
+        if (!mountedRef.current) return;
+        if (saved) restoreSession(saved);
+        else setAuthState("unauthenticated");
+      })
+      .catch((error) => {
+        if (!mountedRef.current) return;
+        setLastError(zhMessage(errorMessage(error)));
+        setAuthState("unauthenticated");
+      });
+    return () => {
+      mountedRef.current = false;
+      cleanupSocket(socketRef.current);
+    };
   }, []);
 
+  useEffect(() => {
+    if (!room) return;
+    setBuyIn(String(room.rules.minBuyIn));
+    setRaiseTo("");
+  }, [room?.id]);
+
+  useEffect(() => {
+    setRaiseTo("");
+    setPendingOps((prev) => ({ ...prev, "game:action": false }));
+  }, [room?.game?.street, room?.game?.availableActions?.minRaiseTo, room?.game?.availableActions?.maxRaiseTo]);
+
   async function restoreSession(savedToken: string) {
+    setAuthState("restoring");
     try {
-      const result = await api("/auth/me", savedToken);
-      await acceptAuth(savedToken, result.user as User);
-    } catch {
-      await AsyncStorage.removeItem(tokenKey);
+      const result = await apiRequest<{ user: unknown }>(apiBase, "/auth/me", { token: savedToken });
+      await acceptAuth(savedToken, readUser(result.user));
+    } catch (error) {
+      if (error instanceof AuthExpiredError) {
+        await tokenStorage.clear();
+        setToken("");
+        setAuthState("unauthenticated");
+        return;
+      }
+      setToken(savedToken);
+      setAuthState("offline-authenticated");
+      setLastError(zhMessage(errorMessage(error)));
     }
   }
 
   async function submitAuth() {
+    if (busy || authState === "authenticating") return;
     setBusy(true);
+    setAuthState("authenticating");
     setLastError("");
     try {
       const path = authMode === "login" ? "/auth/login" : "/auth/register";
-      const result = await api(path, undefined, { username, password, nickname, avatar });
-      await acceptAuth(String(result.token), result.user as User);
+      const result = await apiRequest<{ token: unknown; user: unknown }>(apiBase, path, { body: { username, password, nickname, avatar } });
+      await acceptAuth(readToken(result.token), readUser(result.user));
     } catch (error) {
+      setAuthState("error");
       showError(error);
     } finally {
       setBusy(false);
@@ -135,12 +177,15 @@ export default function App() {
   }
 
   async function submitGuest() {
+    if (busy || authState === "authenticating") return;
     setBusy(true);
+    setAuthState("authenticating");
     setLastError("");
     try {
-      const result = await api("/auth/guest", undefined, {});
-      await acceptAuth(String(result.token), result.user as User);
+      const result = await apiRequest<{ token: unknown; user: unknown }>(apiBase, "/auth/guest", { body: {} });
+      await acceptAuth(readToken(result.token), readUser(result.user));
     } catch (error) {
+      setAuthState("error");
       showError(error);
     } finally {
       setBusy(false);
@@ -148,26 +193,40 @@ export default function App() {
   }
 
   async function acceptAuth(nextToken: string, nextUser: User) {
+    const safeSocketUrl = validateSocketUrl(socketUrl);
+    validateHttpBaseUrl(apiBase);
+    await tokenStorage.set(nextToken);
     setToken(nextToken);
     setUser(nextUser);
-    await AsyncStorage.setItem(tokenKey, nextToken);
-    connectSocket(nextToken);
+    connectSocket(nextToken, safeSocketUrl);
+    setAuthState("authenticated");
   }
 
   async function logout() {
-    socket?.disconnect();
-    await AsyncStorage.removeItem(tokenKey);
-    setToken("");
-    setUser(null);
-    setRoom(null);
-    setRooms([]);
-    setStatus("idle");
+    setAuthState("logging-out");
+    cleanupSocket(socketRef.current);
+    socketRef.current = null;
+    setSocket(null);
+    try {
+      await tokenStorage.clear();
+    } catch (error) {
+      setLastError(zhMessage(errorMessage(error)));
+    } finally {
+      setToken("");
+      setUser(null);
+      setRoom(null);
+      setRooms([]);
+      setPendingOps({});
+      setRaiseTo("");
+      setStatus("idle");
+      setAuthState("unauthenticated");
+    }
   }
 
-  function connectSocket(nextToken = token) {
-    socket?.disconnect();
+  function connectSocket(nextToken = token, url = validateSocketUrl(socketUrl)) {
+    cleanupSocket(socketRef.current);
     setStatus("connecting");
-    const next = io(socketUrl.trim(), {
+    const next = io(url, {
       transports: ["websocket"],
       auth: { token: nextToken, clientBuild },
       reconnection: true,
@@ -179,12 +238,13 @@ export default function App() {
     next.on("connect", () => {
       setStatus("online");
       setLastError("");
+      setAuthState("authenticated");
       next.emit("rooms:resume");
     });
     next.on("session", setUser);
     next.on("rooms:list", setRooms);
     next.on("room:state", (nextRoom: RoomState | null) => setRoom(nextRoom && nextRoom.status !== "playing" ? { ...nextRoom, game: null } : nextRoom));
-    next.on("error:message", ({ message }: { message: string }) => Alert.alert("提示", zhMessage(message)));
+    next.on("error:message", ({ message }: { message: string }) => showError(message));
     next.on("disconnect", (reason) => {
       setStatus(next.active ? "reconnecting" : "offline");
       setLastError(zhMessage(reason));
@@ -194,49 +254,56 @@ export default function App() {
       setStatus("offline");
       setLastError(zhMessage(error.message));
     });
+    socketRef.current = next;
     setSocket(next);
   }
 
-  function emit(event: string, payload: Record<string, unknown> = {}, onOk?: (result: Record<string, unknown>) => void) {
+  function emit(event: string, payload: Record<string, unknown> = {}, onOk?: (result: Record<string, unknown>) => void, key = event) {
+    if (pendingOps[key]) return;
     if (!socket?.connected) {
       setLastError("正在等待连接");
+      socket?.emit("rooms:resume");
       return;
     }
-    setBusy(true);
-    socket.timeout(6000).emit(event, payload, (error: Error | null, result?: { ok: boolean; error?: string; [key: string]: unknown }) => {
-      setBusy(false);
-      if (error) return setLastError("请求超时");
+    setPendingOps((prev) => ({ ...prev, [key]: true }));
+    const operationId = `${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}`;
+    socket.timeout(6000).emit(event, { ...payload, operationId }, (error: Error | null, result?: { ok: boolean; error?: string; [key: string]: unknown }) => {
+      if (!mountedRef.current) return;
+      setPendingOps((prev) => ({ ...prev, [key]: false }));
+      if (error) {
+        setLastError("请求超时，正在同步房间状态");
+        socket.emit("rooms:resume");
+        return;
+      }
       if (!result?.ok) return showError(result?.error ?? "操作失败");
       onOk?.(result);
     });
   }
 
-  async function joinVoice() {
-    if (Platform.OS === "android") {
-      const granted = await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.RECORD_AUDIO);
-      if (granted !== PermissionsAndroid.RESULTS.GRANTED) return showError("麦克风权限被拒绝");
-    }
-    emit("voice:join", {}, (result) => setVoiceToken(String(result.voiceToken ?? "")));
-  }
-
   function showError(error: unknown) {
-    const message = error instanceof Error ? error.message : String(error);
-    setLastError(zhMessage(message));
-    Alert.alert("提示", zhMessage(message));
+    const message = zhMessage(errorMessage(error));
+    setLastError(message);
+    if (errorLimiter.shouldShow(message)) Alert.alert("提示", message);
   }
 
-  async function api(path: string, authToken?: string, body?: Record<string, string>) {
-    const res = await fetch(`${apiBase.trim()}${path}`, {
-      method: body ? "POST" : "GET",
-      headers: {
-        "content-type": "application/json",
-        ...(authToken ? { authorization: `Bearer ${authToken}` } : {})
-      },
-      body: body ? JSON.stringify(body) : undefined
-    });
-    const json = (await res.json()) as { ok: boolean; error?: string; [key: string]: unknown };
-    if (!json.ok) throw new Error(json.error ?? "请求失败");
-    return json;
+  function sitAt(index: number) {
+    if (!room) return;
+    try {
+      const amount = parseChipAmountInRange(buyIn || String(room.rules.minBuyIn), room.rules.minBuyIn, room.rules.maxBuyIn, "买入");
+      emit("seat:sit", { seat: index, buyIn: amount }, undefined, `seat:sit:${index}`);
+    } catch (error) {
+      showError(error);
+    }
+  }
+
+  function submitBetRaise() {
+    if (!actions) return;
+    try {
+      const amount = parseChipAmountInRange(raiseTo || String(actions.minRaiseTo), actions.minRaiseTo, actions.maxRaiseTo, "下注");
+      emit("game:action", { type: actions.canBet ? "bet" : "raise", amount }, () => setRaiseTo(""), "game:action");
+    } catch (error) {
+      showError(error);
+    }
   }
 
   if (!user) {
@@ -246,10 +313,12 @@ export default function App() {
         <ScrollView contentContainerStyle={styles.connectPanel}>
           <Text style={styles.title}>德州扑克</Text>
           <Text style={styles.caption}>仅使用虚拟筹码</Text>
-          <Pressable style={styles.textButton} onPress={() => setShowServerSettings(!showServerSettings)}>
-            <Text style={styles.joinText}>{showServerSettings ? "隐藏服务器设置" : "服务器设置"}</Text>
-          </Pressable>
-          {showServerSettings ? (
+          {canEditServer ? (
+            <Pressable style={styles.textButton} onPress={() => setShowServerSettings(!showServerSettings)}>
+              <Text style={styles.joinText}>{showServerSettings ? "隐藏服务器设置" : "服务器设置"}</Text>
+            </Pressable>
+          ) : null}
+          {canEditServer && showServerSettings ? (
             <>
               <Text style={styles.label}>接口地址</Text>
               <TextInput value={apiBase} onChangeText={setApiBase} autoCapitalize="none" autoCorrect={false} style={styles.input} />
@@ -289,7 +358,7 @@ export default function App() {
       <SafeAreaView style={styles.screen}>
         <Header user={user} status={status} onLogout={logout} />
         <View style={styles.lobbyActions}>
-          <Pressable style={styles.primaryButton} onPress={() => emit("rooms:create", { name: `${user.nickname}的牌桌` })}>
+          <Pressable style={[styles.primaryButton, pendingOps["rooms:create"] && styles.disabledButton]} disabled={pendingOps["rooms:create"]} onPress={() => emit("rooms:create", { name: `${user.nickname}的牌桌` }, undefined, "rooms:create")}>
             <Text style={styles.primaryText}>创建牌桌</Text>
           </Pressable>
           <Pressable style={styles.ghostButton} onPress={() => socket?.emit("rooms:list")}>
@@ -301,7 +370,7 @@ export default function App() {
           keyExtractor={(item) => item.id}
           contentContainerStyle={styles.roomList}
           renderItem={({ item }) => (
-            <Pressable style={styles.roomRow} onPress={() => emit("rooms:join", { roomId: item.id })}>
+            <Pressable style={styles.roomRow} disabled={pendingOps[`rooms:join:${item.id}`]} onPress={() => emit("rooms:join", { roomId: item.id }, undefined, `rooms:join:${item.id}`)}>
               <View style={styles.roomText}>
                 <Text style={styles.roomName} numberOfLines={1}>
                   {item.name}
@@ -332,7 +401,7 @@ export default function App() {
             {roomStatusLabel(room.status)} / 盲注 {room.rules.smallBlind}-{room.rules.bigBlind} / 买入 {room.rules.minBuyIn}-{room.rules.maxBuyIn}
           </Text>
         </View>
-        <Pressable style={[styles.ghostButton, room.status === "playing" && styles.disabledOutline]} disabled={room.status === "playing"} onPress={() => emit("rooms:leave")}>
+        <Pressable style={[styles.ghostButton, (room.status === "playing" || pendingOps["rooms:leave"]) && styles.disabledOutline]} disabled={room.status === "playing" || pendingOps["rooms:leave"]} onPress={() => emit("rooms:leave", {}, undefined, "rooms:leave")}>
           <Text style={styles.ghostText}>离开</Text>
         </Pressable>
       </View>
@@ -341,7 +410,7 @@ export default function App() {
         <View style={styles.table}>
           <View style={styles.tableRail} />
           {room.seats.map((seat, index) => (
-            <SeatView key={index} seat={seat} index={index} userId={user.id} game={room.game} disabled={busy || room.status === "playing"} onSit={() => emit("seat:sit", { seat: index, buyIn: Number(buyIn || room.rules.minBuyIn) })} />
+            <SeatView key={index} seat={seat} index={index} userId={user.id} game={room.game} disabled={anyPending || room.status === "playing"} onSit={() => sitAt(index)} />
           ))}
           <View style={styles.board}>
             <Text style={styles.street}>{streetLabel(room.game?.street ?? "lobby")}</Text>
@@ -372,16 +441,16 @@ export default function App() {
         ) : null}
 
         <View style={styles.controlPanel}>
-          <VoicePanel room={room} myVoice={myVoice} voiceToken={voiceToken} onJoin={joinVoice} onLeave={() => emit("voice:leave", {}, () => setVoiceToken(""))} onMute={() => emit("voice:mute", { muted: !myVoice?.muted })} onSpeaking={() => emit("voice:speaking", { speaking: !myVoice?.speaking })} />
+          <VoicePanel />
 
           {room.status !== "playing" ? (
             <>
               {mySeat ? (
                 <View style={styles.row}>
-                  <Pressable style={styles.ghostButton} onPress={() => emit("seat:leave")}>
+                  <Pressable style={[styles.ghostButton, pendingOps["seat:leave"] && styles.disabledButton]} disabled={pendingOps["seat:leave"]} onPress={() => emit("seat:leave", {}, undefined, "seat:leave")}>
                     <Text style={styles.ghostText}>起身</Text>
                   </Pressable>
-                  <Pressable style={mySeat.ready ? styles.warnButton : styles.primaryButton} onPress={() => emit("seat:ready", { ready: !mySeat.ready })}>
+                  <Pressable style={[mySeat.ready ? styles.warnButton : styles.primaryButton, pendingOps["seat:ready"] && styles.disabledButton]} disabled={pendingOps["seat:ready"]} onPress={() => emit("seat:ready", { ready: !mySeat.ready }, undefined, "seat:ready")}>
                     <Text style={styles.primaryText}>{mySeat.ready ? "取消准备" : "准备"}</Text>
                   </Pressable>
                 </View>
@@ -392,7 +461,7 @@ export default function App() {
                 </View>
               )}
               {room.ownerId === user.id ? (
-                <Pressable style={styles.primaryButton} onPress={() => emit("game:start")}>
+                <Pressable style={[styles.primaryButton, pendingOps["game:start"] && styles.disabledButton]} disabled={pendingOps["game:start"]} onPress={() => emit("game:start", {}, undefined, "game:start")}>
                   <Text style={styles.primaryText}>开始一局</Text>
                 </Pressable>
               ) : null}
@@ -401,19 +470,19 @@ export default function App() {
             <>
               <Text style={styles.actionHint}>{actions.canCheck ? "轮到你行动" : `跟注 ${actions.toCall} 继续`}</Text>
               <View style={styles.row}>
-                <Pressable style={styles.dangerButton} onPress={() => emit("game:action", { type: "fold" })}>
+                <Pressable style={[styles.dangerButton, pendingOps["game:action"] && styles.disabledButton]} disabled={pendingOps["game:action"]} onPress={() => emit("game:action", { type: "fold" }, undefined, "game:action")}>
                   <Text style={styles.lightButtonText}>弃牌</Text>
                 </Pressable>
-                <Pressable style={styles.primaryButton} onPress={() => emit("game:action", { type: actions.canCheck ? "check" : "call" })}>
+                <Pressable style={[styles.primaryButton, pendingOps["game:action"] && styles.disabledButton]} disabled={pendingOps["game:action"]} onPress={() => emit("game:action", { type: actions.canCheck ? "check" : "call" }, undefined, "game:action")}>
                   <Text style={styles.primaryText}>{actions.canCheck ? "过牌" : `跟注 ${actions.toCall}`}</Text>
                 </Pressable>
-                <Pressable style={styles.warnButton} onPress={() => emit("game:action", { type: "all-in" })}>
+                <Pressable style={[styles.warnButton, pendingOps["game:action"] && styles.disabledButton]} disabled={pendingOps["game:action"]} onPress={() => emit("game:action", { type: "all-in" }, undefined, "game:action")}>
                   <Text style={styles.lightButtonText}>全下</Text>
                 </Pressable>
               </View>
               <View style={styles.row}>
                 <TextInput value={raiseTo} onChangeText={setRaiseTo} keyboardType="number-pad" placeholder={`${actions.minRaiseTo}-${actions.maxRaiseTo}`} placeholderTextColor="#8d948f" style={[styles.input, styles.raiseInput]} />
-                <Pressable style={styles.primaryButton} onPress={() => emit("game:action", { type: actions.canBet ? "bet" : "raise", amount: Number(raiseTo || actions.minRaiseTo) })}>
+                <Pressable style={[styles.primaryButton, pendingOps["game:action"] && styles.disabledButton]} disabled={pendingOps["game:action"]} onPress={submitBetRaise}>
                   <Text style={styles.primaryText}>{actions.canBet ? "下注" : "加注"}</Text>
                 </Pressable>
               </View>
@@ -426,6 +495,38 @@ export default function App() {
       </ScrollView>
     </SafeAreaView>
   );
+}
+
+function cleanupSocket(socket: Socket | null): void {
+  socket?.removeAllListeners();
+  socket?.io.removeAllListeners();
+  socket?.disconnect();
+}
+
+function readToken(value: unknown): string {
+  if (typeof value !== "string" || !value.trim() || value === "undefined" || value === "null") throw new InvalidResponseError("登录响应缺少 Token");
+  return value.trim();
+}
+
+function readUser(value: unknown): User {
+  const user = value as Partial<User> | null;
+  if (!user || typeof user.id !== "string" || typeof user.nickname !== "string" || typeof user.chips !== "number") throw new InvalidResponseError("登录响应缺少用户信息");
+  return {
+    id: user.id,
+    username: typeof user.username === "string" ? user.username : null,
+    nickname: user.nickname,
+    avatar: typeof user.avatar === "string" ? user.avatar : "P00",
+    chips: user.chips
+  };
+}
+
+function errorMessage(error: unknown): string {
+  if (error instanceof AuthExpiredError) return "登录已失效，请重新登录";
+  if (error instanceof NetworkError) return "网络连接失败，已保留登录状态";
+  if (error instanceof TimeoutError) return "请求超时，请稍后重试";
+  if (error instanceof ServerError) return "服务暂不可用，请稍后重试";
+  if (error instanceof InvalidResponseError) return error.message;
+  return error instanceof Error ? error.message : String(error);
 }
 
 function Header({ user, status, onLogout }: { user: User; status: ConnectionStatus; onLogout: () => void }) {
@@ -449,27 +550,11 @@ function Header({ user, status, onLogout }: { user: User; status: ConnectionStat
   );
 }
 
-function VoicePanel({ room, myVoice, voiceToken, onJoin, onLeave, onMute, onSpeaking }: { room: RoomState; myVoice?: VoiceUser; voiceToken: string; onJoin: () => void; onLeave: () => void; onMute: () => void; onSpeaking: () => void }) {
+function VoicePanel() {
   return (
     <View style={styles.voicePanel}>
-      <Text style={styles.panelTitle}>语音{myVoice ? (myVoice.muted ? "已静音" : "已连接") : "已关闭"}</Text>
-      <Text style={styles.subtle}>{room.voice.filter((voice) => voice.speaking).map((voice) => `${voice.nickname} 正在说话`).join(" / ") || "暂无说话玩家"}</Text>
-      <View style={styles.row}>
-        <Pressable style={myVoice ? styles.warnButton : styles.primaryButton} onPress={myVoice ? onLeave : onJoin}>
-          <Text style={myVoice ? styles.lightButtonText : styles.primaryText}>{myVoice ? "关闭语音" : "打开语音"}</Text>
-        </Pressable>
-        {myVoice ? (
-          <>
-            <Pressable style={styles.ghostButton} onPress={onMute}>
-              <Text style={styles.ghostText}>{myVoice.muted ? "取消静音" : "静音"}</Text>
-            </Pressable>
-            <Pressable style={styles.ghostButton} onPress={onSpeaking}>
-              <Text style={styles.ghostText}>{myVoice.speaking ? "停止说话" : "说话中"}</Text>
-            </Pressable>
-          </>
-        ) : null}
-      </View>
-      {voiceToken ? <Text style={styles.subtle}>已获取房间语音令牌</Text> : null}
+      <Text style={styles.panelTitle}>语音暂未开放</Text>
+      <Text style={styles.subtle}>当前版本没有接入 RTC 音频采集、传输和播放，已禁用麦克风入口。</Text>
     </View>
   );
 }

@@ -12,9 +12,10 @@
     "dev:server": "npm --workspace server run dev",
     "dev:mobile": "npm --workspace mobile run start",
     "start": "npm --workspace server start",
-    "test": "npm --workspace server test",
+    "test": "npm --workspace server test && npm --workspace mobile test",
     "typecheck": "npm --workspace server run typecheck && npm --workspace mobile run typecheck",
     "check": "npm test && npm run typecheck",
-    "build:apk": "eas build -p android --profile preview"
+    "build:apk": "eas build -p android --profile preview",
+    "check:android-signature": "node scripts/check-android-signature.mjs"
   }
 }

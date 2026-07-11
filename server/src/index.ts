@@ -4,6 +4,8 @@ import { guestLogin, login, register, requireClientBuild, signVoiceToken, verify
 import { AppDatabase, type UserRecord } from "./db.js";
 import { RoomStore, type Room, type RoomRules } from "./roomStore.js";
 import type { PlayerAction } from "./game/gameEngine.js";
+import { parseChipAmount } from "./amount.js";
+import { OperationDeduper, type AckResult } from "./operations.js";
 
 const port = Number(process.env.PORT ?? 4000);
 const corsOrigin = process.env.CORS_ORIGIN ?? "*";
@@ -12,6 +14,7 @@ const minClientBuild = Number(process.env.MIN_CLIENT_BUILD ?? 2);
 const db = new AppDatabase();
 const rooms = new RoomStore(db);
 const actionTimers = new Map<string, NodeJS.Timeout>();
+const operations = new OperationDeduper();
 
 const httpServer = createServer(async (req, res) => {
   setCors(res);
@@ -56,8 +59,8 @@ io.on("connection", (socket: Socket) => {
   socket.on("rooms:list", () => socket.emit("rooms:list", rooms.listRooms()));
   socket.on("rooms:resume", () => resumeRoom(socket, user));
 
-  socket.on("rooms:create", (payload: { name?: string; rules?: Partial<RoomRules> } = {}, ack?: Ack) =>
-    handle(socket, ack, () => {
+  socket.on("rooms:create", (payload: { name?: string; rules?: Partial<RoomRules>; operationId?: string } = {}, ack?: Ack) =>
+    handle(socket, ack, payload, () => {
       const room = rooms.createRoom(user, payload.name, payload.rules);
       socket.join(room.id);
       socket.emit("room:state", rooms.publicRoom(room.id, user.id));
@@ -66,8 +69,8 @@ io.on("connection", (socket: Socket) => {
     })
   );
 
-  socket.on("rooms:join", (payload: { roomId: string }, ack?: Ack) =>
-    handle(socket, ack, () => {
+  socket.on("rooms:join", (payload: { roomId: string; operationId?: string }, ack?: Ack) =>
+    handle(socket, ack, payload, () => {
       const room = rooms.joinRoom(user, payload.roomId);
       socket.join(room.id);
       emitRoom(room);
@@ -76,8 +79,8 @@ io.on("connection", (socket: Socket) => {
     })
   );
 
-  socket.on("rooms:leave", (_payload: unknown, ack?: Ack) =>
-    handle(socket, ack, () => {
+  socket.on("rooms:leave", (payload: { operationId?: string } = {}, ack?: Ack) =>
+    handle(socket, ack, payload, () => {
       const room = rooms.leaveRoom(user.id);
       if (room) socket.leave(room.id);
       socket.emit("room:state", null);
@@ -88,9 +91,11 @@ io.on("connection", (socket: Socket) => {
     })
   );
 
-  socket.on("seat:sit", (payload: { seat: number; buyIn?: number }, ack?: Ack) =>
-    handle(socket, ack, () => {
-      const room = rooms.sit(user, payload.seat, Number(payload.buyIn ?? 1000));
+  socket.on("seat:sit", (payload: { seat: number; buyIn?: number | string; operationId?: string }, ack?: Ack) =>
+    handle(socket, ack, payload, () => {
+      const current = rooms.currentRoom(user.id);
+      const buyIn = parseChipAmount(payload.buyIn ?? current?.rules.minBuyIn ?? 1000, "Buy-in");
+      const room = rooms.sit(user, payload.seat, buyIn);
       refreshSession(socket);
       emitRoom(room);
       emitRooms();
@@ -98,8 +103,8 @@ io.on("connection", (socket: Socket) => {
     })
   );
 
-  socket.on("seat:leave", (_payload: unknown, ack?: Ack) =>
-    handle(socket, ack, () => {
+  socket.on("seat:leave", (payload: { operationId?: string } = {}, ack?: Ack) =>
+    handle(socket, ack, payload, () => {
       const room = rooms.leaveSeat(user.id);
       refreshSession(socket);
       emitRoom(room);
@@ -108,16 +113,16 @@ io.on("connection", (socket: Socket) => {
     })
   );
 
-  socket.on("seat:ready", (payload: { ready: boolean }, ack?: Ack) =>
-    handle(socket, ack, () => {
+  socket.on("seat:ready", (payload: { ready: boolean; operationId?: string }, ack?: Ack) =>
+    handle(socket, ack, payload, () => {
       const room = rooms.setReady(user.id, Boolean(payload.ready));
       emitRoom(room);
       return {};
     })
   );
 
-  socket.on("game:start", (_payload: unknown, ack?: Ack) =>
-    handle(socket, ack, () => {
+  socket.on("game:start", (payload: { operationId?: string } = {}, ack?: Ack) =>
+    handle(socket, ack, payload, () => {
       const room = rooms.startGame(user.id);
       emitRoom(room);
       emitRooms();
@@ -126,9 +131,10 @@ io.on("connection", (socket: Socket) => {
     })
   );
 
-  socket.on("game:action", (payload: { type: PlayerAction; amount?: number }, ack?: Ack) =>
-    handle(socket, ack, () => {
-      const room = rooms.action(user.id, payload.type, Number(payload.amount ?? 0));
+  socket.on("game:action", (payload: { type: PlayerAction; amount?: number | string; operationId?: string }, ack?: Ack) =>
+    handle(socket, ack, payload, () => {
+      const amount = payload.amount === undefined ? undefined : parseChipAmount(payload.amount, "Bet");
+      const room = rooms.action(user.id, payload.type, amount);
       emitRoom(room);
       emitRooms();
       scheduleRoomTimer(room);
@@ -136,32 +142,32 @@ io.on("connection", (socket: Socket) => {
     })
   );
 
-  socket.on("voice:join", (_payload: unknown, ack?: Ack) =>
-    handle(socket, ack, () => {
+  socket.on("voice:join", (payload: { operationId?: string } = {}, ack?: Ack) =>
+    handle(socket, ack, payload, () => {
       const room = rooms.joinVoice(user.id);
       emitRoom(room);
       return { voiceToken: signVoiceToken(user.id, room.id), roomId: room.id };
     })
   );
 
-  socket.on("voice:leave", (_payload: unknown, ack?: Ack) =>
-    handle(socket, ack, () => {
+  socket.on("voice:leave", (payload: { operationId?: string } = {}, ack?: Ack) =>
+    handle(socket, ack, payload, () => {
       const room = rooms.leaveVoice(user.id);
       emitRoom(room);
       return {};
     })
   );
 
-  socket.on("voice:mute", (payload: { muted: boolean }, ack?: Ack) =>
-    handle(socket, ack, () => {
+  socket.on("voice:mute", (payload: { muted: boolean; operationId?: string }, ack?: Ack) =>
+    handle(socket, ack, payload, () => {
       const room = rooms.setVoiceMuted(user.id, Boolean(payload.muted));
       emitRoom(room);
       return {};
     })
   );
 
-  socket.on("voice:speaking", (payload: { speaking: boolean }, ack?: Ack) =>
-    handle(socket, ack, () => {
+  socket.on("voice:speaking", (payload: { speaking: boolean; operationId?: string }, ack?: Ack) =>
+    handle(socket, ack, payload, () => {
       const room = rooms.setVoiceSpeaking(user.id, Boolean(payload.speaking));
       emitRoom(room);
       return {};
@@ -178,15 +184,25 @@ httpServer.listen(port, "0.0.0.0", () => {
   console.log(`Texas Hold'em server listening on http://0.0.0.0:${port}`);
 });
 
-type Ack = (result: { ok: boolean; error?: string; [key: string]: unknown }) => void;
+type Ack = (result: AckResult) => void;
 
-function handle(socket: Socket, ack: Ack | undefined, work: () => Record<string, unknown>): void {
+function handle(socket: Socket, ack: Ack | undefined, payload: { operationId?: unknown }, work: () => Record<string, unknown>): void {
+  const user = socket.data.user as UserRecord;
+  const cached = operations.get(user.id, payload.operationId);
+  if (cached) {
+    ack?.(cached);
+    return;
+  }
   try {
-    ack?.({ ok: true, ...work() });
+    const result = { ok: true, ...work() };
+    operations.set(user.id, payload.operationId, result);
+    ack?.(result);
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown error";
+    const result = { ok: false, error: message };
+    operations.set(user.id, payload.operationId, result);
     socket.emit("error:message", { message });
-    ack?.({ ok: false, error: message });
+    ack?.(result);
   }
 }
 
