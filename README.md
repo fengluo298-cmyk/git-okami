@@ -21,17 +21,16 @@ mobile/
   app.json                     # Android package/config
   src/components/CardView.tsx
 scripts/check-android-signature.mjs
+scripts/verify-android-release.mjs
 eas.json                       # APK preview build profile
 .env.example
-.env.development
-.env.production
 ```
 
 The server is authoritative. The app never deals cards, settles pots, changes chips, or receives opponents' hole cards before showdown.
 
 ## Database Migration
 
-Runtime auto-migration runs when the server starts. The same schema is recorded in:
+Runtime auto-migration runs when the server starts. Applied versions are recorded in the `schema_migrations` table. The same schema is recorded in:
 
 ```text
 server/migrations/001_init.sql
@@ -49,16 +48,32 @@ Override it:
 set DATABASE_URL=./data/holdem.db
 ```
 
+Production must use a durable SQLite file. The server refuses `:memory:` and `/tmp/*` when `NODE_ENV=production`.
+
 Tables:
 
 - `users`: username, bcrypt password hash, nickname, avatar URL/code, persisted bank chips.
 - `chip_transactions`: signed ledger rows for buy-in, cash-out, win/loss, admin adjustment.
 
+Backup:
+
+```bash
+sqlite3 /var/data/holdem.db ".backup '/var/data/holdem-backup.db'"
+```
+
+Restore:
+
+```bash
+cp /var/data/holdem-backup.db /var/data/holdem.db
+```
+
+For Render, attach a persistent disk mounted at `/var/data` before using `DATABASE_URL=/var/data/holdem.db`. Do not use `/tmp/holdem.db` for production data.
+
 ## Backend
 
 ```bash
 cd E:/Git/texas-holdem-mobile
-npm install
+npm ci
 set JWT_SECRET=replace-with-a-long-random-secret
 set DATABASE_URL=./data/holdem.db
 npm run dev:server
@@ -78,10 +93,10 @@ Socket.IO requires:
 auth: { token: "JWT" }
 ```
 
-Current Socket clients must also send `clientBuild >= MIN_CLIENT_BUILD`:
+Current HTTP auth and Socket clients must send `clientBuild >= MIN_CLIENT_BUILD`:
 
 ```js
-auth: { token: "JWT", clientBuild: 2 }
+auth: { token: "JWT", clientBuild: 3 }
 ```
 
 ## Render Deploy
@@ -99,9 +114,9 @@ Set env vars like this:
 ```text
 NODE_ENV=production
 JWT_SECRET=<long-random-secret>
-DATABASE_URL=/tmp/holdem.db
-CORS_ORIGIN=*
-SOCKET_CORS_ORIGIN=*
+DATABASE_URL=/var/data/holdem.db
+CORS_ORIGIN=https://git-okami.onrender.com
+SOCKET_CORS_ORIGIN=https://git-okami.onrender.com
 DEFAULT_CHIPS=10000
 DEFAULT_SMALL_BLIND=50
 DEFAULT_BIG_BLIND=100
@@ -109,13 +124,13 @@ DEFAULT_MIN_BUY_IN=1000
 DEFAULT_MAX_BUY_IN=10000
 DEFAULT_MAX_PLAYERS=6
 DEFAULT_ACTION_TIMEOUT_SECONDS=30
-MIN_CLIENT_BUILD=2
+MIN_CLIENT_BUILD=3
 VOICE_PROVIDER=none
 ```
 
 Do not set `DATABASE_URL=DATABASE_URL=...`. Do not use a Windows path such as `E:\Git\...` on Render.
 
-`/tmp/holdem.db` is enough to start the service on Render's free plan, but it is not durable across restarts. Use a paid Render disk with a Linux path like `/var/data/holdem.db`, or migrate to PostgreSQL, when persistent chips matter.
+`/tmp/holdem.db` is blocked in production because it is not durable across restarts. Use a Render persistent disk with a Linux path like `/var/data/holdem.db`, or migrate to PostgreSQL before production traffic depends on persisted chips.
 
 ## Frontend
 
@@ -208,10 +223,10 @@ Build APK:
 npm run build:apk
 ```
 
-Download the APK from the EAS build link, then install:
+Download the APK from the EAS build link, copy it to the desktop, then push it to the phone Download directory:
 
 ```bash
-adb install path/to/app.apk
+adb push C:\Users\LWW\Desktop\git-okami-release.apk /sdcard/Download/git-okami-release.apk
 ```
 
 If EAS is not logged in:
@@ -263,9 +278,10 @@ Check a signed artifact:
 
 ```powershell
 npm run check:android-signature -- mobile/android/app/build/outputs/apk/release/app-release.apk
+npm run verify:android-release -- mobile/android/app/build/outputs/apk/release/app-release.apk
 ```
 
-The check fails when the certificate subject contains `Android Debug`.
+The release verification checks signature, package, version, `assets/index.android.bundle`, `debuggable=false`, cleartext traffic, and obvious secret/test file names.
 
 Current Android permissions are limited to network access plus AndroidX's app-private dynamic receiver permission. App data backup is disabled so auth tokens in SecureStore are not backed up.
 
@@ -295,6 +311,7 @@ MIN_CLIENT_BUILD
 ## Current Limits
 
 - Rooms are still in memory; restart clears active tables but not users/chip ledger.
+- Production persistence still depends on a durable SQLite disk. PostgreSQL migration is the next step before multi-instance or higher availability deployment.
 - Real audio transport is not wired yet; mobile voice is intentionally disabled.
 - No admin UI.
 - No production Redis/session clustering.

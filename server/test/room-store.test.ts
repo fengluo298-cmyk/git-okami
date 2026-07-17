@@ -29,3 +29,17 @@ test("finished hands clear the table and stop later auto actions", () => {
   assert.equal(store.publicRoom(room.id, users[0].id).game, null);
   assert.equal(room.seats.reduce((sum, seat) => sum + (seat?.chips ?? 0), 0), 4000);
 });
+
+test("room state version increments and rejects stale actions", () => {
+  const db = new AppDatabase(join(tmpdir(), `holdem-${randomUUID()}.db`));
+  const store = new RoomStore(db);
+  const user = db.getOrCreateGuest(undefined, "P0");
+  const room = store.createRoom(user);
+  const firstVersion = store.publicRoom(room.id, user.id).stateVersion;
+
+  store.sit(user, 0, 1000);
+  assert.equal(store.publicRoom(room.id, user.id).stateVersion > firstVersion, true);
+  assert.throws(() => store.assertFresh(user.id, firstVersion), /State version is stale/);
+  assert.doesNotThrow(() => store.assertFresh(user.id, store.publicRoom(room.id, user.id).stateVersion));
+  db.close();
+});

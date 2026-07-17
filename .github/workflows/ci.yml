@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - name: Secret file guard
+        run: |
+          blocked="$(git ls-files | grep -Ei '(^|/)(\.env(\..*)?|.*\.keystore|.*\.jks|.*-passwords\.txt)$' | grep -v '^\.env\.example$' || true)"
+          if [ -n "$blocked" ]; then
+            echo "$blocked"
+            exit 1
+          fi
+      - name: Lint if configured
+        run: npm run | grep -qE '^  lint$' && npm run lint || true
+      - run: npm test
+      - run: npm run typecheck
+      - run: npm run check
+      - run: npm audit --audit-level=high

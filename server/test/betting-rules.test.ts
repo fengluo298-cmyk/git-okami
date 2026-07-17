@@ -49,6 +49,26 @@ test("folded players cannot act and timeout folds when check is unavailable", ()
   assert.equal(engine.state.players.find((player) => player.id === "p1")?.folded, true);
 });
 
+test("engine rejects invalid actions and unsafe bet amounts without changing chips", () => {
+  const engine = new GameEngine({ smallBlind: 10, bigBlind: 20, minRaise: 20, bettingMode: "no_limit" });
+  engine.startHand(players([100, 100]), { dealerSeat: 0, deck: deck() });
+  const before = engine.state.players.map((player) => [player.id, player.chips, player.bet, player.totalBet]);
+
+  assert.throws(() => engine.executeAction("p0", "noop" as never), /Invalid action/);
+  for (const amount of [-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1]) {
+    assert.throws(() => engine.executeAction("p0", "raise", amount), /safe positive integer|exceed|Not enough/);
+  }
+  assert.deepEqual(engine.state.players.map((player) => [player.id, player.chips, player.bet, player.totalBet]), before);
+});
+
+test("engine accepts deterministic random injection for shuffling", () => {
+  const engine = new GameEngine({ smallBlind: 10, bigBlind: 20, minRaise: 20, bettingMode: "no_limit" });
+  engine.startHand(players([100, 100]), { dealerSeat: 0, random: () => 0 });
+
+  assert.equal(engine.state.deck.length, 48);
+  assert.equal(new Set(engine.state.players.flatMap((player) => player.hand).map((card) => `${card.rank}${card.suit}`)).size, 4);
+});
+
 function players(chips: number[]): StartPlayer[] {
   return chips.map((stack, seat) => ({
     id: `p${seat}`,

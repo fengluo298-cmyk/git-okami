@@ -9,13 +9,13 @@ services:
       - key: NODE_ENV
         value: production
       - key: DATABASE_URL
-        value: /tmp/holdem.db
+        value: /var/data/holdem.db
       - key: JWT_SECRET
         sync: false
       - key: CORS_ORIGIN
-        value: "*"
+        value: https://git-okami.onrender.com
       - key: SOCKET_CORS_ORIGIN
-        value: "*"
+        value: https://git-okami.onrender.com
       - key: DEFAULT_CHIPS
         value: "10000"
       - key: DEFAULT_SMALL_BLIND
@@ -31,6 +31,6 @@ services:
       - key: DEFAULT_ACTION_TIMEOUT_SECONDS
         value: "30"
       - key: MIN_CLIENT_BUILD
-        value: "2"
+        value: "3"
       - key: VOICE_PROVIDER
         value: none

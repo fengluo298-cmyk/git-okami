@@ -30,13 +30,20 @@ export class AppDatabase {
   private readonly db: DatabaseSync;
 
   constructor(file = databaseFile()) {
-    mkdirSync(dirname(file), { recursive: true });
+    assertDurableDatabaseFile(file);
+    if (file !== ":memory:") mkdirSync(dirname(file), { recursive: true });
     this.db = new DatabaseSync(file);
     this.migrate();
   }
 
   migrate(): void {
     this.db.exec(`
+      create table if not exists schema_migrations (
+        version integer primary key,
+        applied_at text not null default current_timestamp
+      );
+    `);
+    this.applyMigration(1, `
       create table if not exists users (
         id text primary key,
         username text,
@@ -65,6 +72,10 @@ export class AppDatabase {
     this.addColumnIfMissing("users", "avatar_url", "text");
     if (this.hasColumn("users", "avatar")) this.db.exec("update users set avatar_url = avatar where avatar_url is null");
     this.db.exec("create unique index if not exists idx_users_username on users(username) where username is not null");
+  }
+
+  close(): void {
+    this.db.close();
   }
 
   getOrCreateGuest(id?: string, nickname?: string): UserRecord {
@@ -166,6 +177,20 @@ export class AppDatabase {
     const rows = this.db.prepare(`pragma table_info(${table})`).all() as Array<{ name: string }>;
     return rows.some((row) => row.name === column);
   }
+
+  private applyMigration(version: number, sql: string): void {
+    const existing = this.db.prepare("select version from schema_migrations where version = ?").get(version);
+    if (existing) return;
+    this.db.exec("begin immediate");
+    try {
+      this.db.exec(sql);
+      this.db.prepare("insert into schema_migrations (version) values (?)").run(version);
+      this.db.exec("commit");
+    } catch (error) {
+      this.db.exec("rollback");
+      throw error;
+    }
+  }
 }
 
 function cleanNickname(nickname?: string): string {
@@ -177,23 +202,37 @@ function cleanAvatar(avatar?: string): string {
 }
 
 function normalizeUsername(username: string): string {
-  return username.trim().toLowerCase().slice(0, 32);
+  return username.trim().toLowerCase();
 }
 
 function stripPassword(user: UserRecord & { passwordHash: string | null }): UserRecord {
   return { id: user.id, username: user.username, nickname: user.nickname, avatar: user.avatar, chips: user.chips };
 }
 
-function databaseFile(): string {
+export function databaseFile(): string {
   let file = process.env.DATABASE_URL ?? process.env.DB_FILE ?? "";
   while (file.startsWith("DATABASE_URL=")) file = file.slice("DATABASE_URL=".length);
   if (!file || (process.platform !== "win32" && /^[A-Za-z]:[\\/]/.test(file))) {
-    file = process.env.RENDER ? "/tmp/holdem.db" : resolve(process.cwd(), "data", "holdem.db");
+    if (isProduction()) throw new Error("DATABASE_URL must point to a durable SQLite file in production");
+    file = resolve(process.cwd(), "data", "holdem.db");
   }
   return file;
+}
+
+export function assertDurableDatabaseFile(file: string): void {
+  if (!isProduction()) return;
+  const normalized = file.replace(/\\/g, "/");
+  if (normalized === ":memory:" || normalized.includes("mode=memory")) throw new Error("DATABASE_URL must not use an in-memory database in production");
+  if (normalized === "/tmp/holdem.db" || normalized.startsWith("/tmp/")) {
+    throw new Error("DATABASE_URL must not use /tmp in production; configure a persistent disk path such as /var/data/holdem.db");
+  }
 }
 
 function positiveInt(value: unknown, fallback: number): number {
   const number = Math.floor(Number(value));
   return Number.isFinite(number) && number > 0 ? number : fallback;
+}
+
+function isProduction(): boolean {
+  return process.env.NODE_ENV === "production";
 }

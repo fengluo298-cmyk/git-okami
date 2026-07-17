@@ -8,6 +8,7 @@ export type ApiOptions = {
   token?: string;
   body?: Record<string, unknown>;
   timeoutMs?: number;
+  clientBuild?: number;
   fetchImpl?: typeof fetch;
 };
 
@@ -41,6 +42,7 @@ export async function apiRequest<T = Record<string, unknown>>(baseUrl: string, p
       method: options.body ? "POST" : "GET",
       headers: {
         "content-type": "application/json",
+        ...(options.clientBuild ? { "x-client-build": String(options.clientBuild) } : {}),
         ...(options.token ? { authorization: `Bearer ${options.token}` } : {})
       },
       body: options.body ? JSON.stringify(options.body) : undefined,
@@ -49,7 +51,6 @@ export async function apiRequest<T = Record<string, unknown>>(baseUrl: string, p
     return await readResponse<T>(res);
   } catch (error) {
     if (error instanceof AuthExpiredError || error instanceof ServerError || error instanceof InvalidResponseError) throw error;
-    if (error instanceof DOMException && error.name === "AbortError") throw new TimeoutError("请求超时");
     if (error instanceof Error && error.name === "AbortError") throw new TimeoutError("请求超时");
     throw new NetworkError("网络连接失败");
   } finally {
@@ -67,16 +68,21 @@ async function readResponse<T>(res: Response): Promise<T> {
   }
   const contentType = res.headers.get("content-type") ?? "";
   if (!contentType.includes("application/json")) throw new InvalidResponseError("服务响应格式错误");
-  let json: { ok?: boolean; error?: string; [key: string]: unknown };
+  let json: { ok?: boolean; error?: string; message?: string; [key: string]: unknown };
   try {
     json = JSON.parse(text) as { ok?: boolean; error?: string; [key: string]: unknown };
   } catch {
     throw new InvalidResponseError("服务响应不是有效 JSON");
   }
-  if (!res.ok || json.ok === false) throw new InvalidResponseError(safeMessage(json.error));
+  if (!res.ok || json.ok === false) throw new InvalidResponseError(safeMessage(json.message ?? json.error));
   return json as T;
 }
 
 function safeMessage(message: unknown): string {
-  return typeof message === "string" && message.length <= 120 ? message : "请求失败";
+  if (typeof message !== "string" || message.length > 120 || looksInternal(message)) return "请求失败";
+  return message;
+}
+
+function looksInternal(message: string): boolean {
+  return /DOMException|ReferenceError|TypeError|SyntaxError|SQLITE|stack|JWT_SECRET|Authorization|Bearer|token|password/i.test(message);
 }

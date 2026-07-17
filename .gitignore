@@ -6,8 +6,13 @@ dist/
 *.db-shm
 *.db-wal
 
-# Keep real local secrets out; the checked-in .env.* files are placeholders.
+# Keep local secrets out. Only .env.example belongs in Git.
 .env
+.env.*
+!.env.example
+*.keystore
+*.jks
+*-passwords.txt
 
 # Python caches and virtual environments
 __pycache__/

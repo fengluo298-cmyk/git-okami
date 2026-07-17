@@ -15,8 +15,10 @@ import { io, type Socket } from "socket.io-client";
 import { apiRequest, AuthExpiredError, InvalidResponseError, NetworkError, ServerError, TimeoutError, validateHttpBaseUrl, validateSocketUrl } from "./src/api/client";
 import { tokenStorage } from "./src/auth/tokenStorage";
 import { CardView, type Card } from "./src/components/CardView";
+import { ProgressBar } from "./src/components/ProgressBar";
 import { ErrorLimiter } from "./src/utils/errorLimiter";
 import { parseChipAmountInRange } from "./src/utils/amount";
+import { progressLabelFor } from "./src/utils/progress";
 
 type User = { id: string; username: string | null; nickname: string; avatar: string; chips: number };
 type Rules = {
@@ -52,6 +54,7 @@ type RoomState = {
   name: string;
   ownerId: string;
   status: "lobby" | "playing" | "finished";
+  stateVersion?: number;
   rules: Rules;
   seats: Array<Seat | null>;
   voice: VoiceUser[];
@@ -76,9 +79,10 @@ type RoomState = {
 type ConnectionStatus = "idle" | "connecting" | "online" | "reconnecting" | "offline";
 type AuthState = "unauthenticated" | "authenticating" | "restoring" | "authenticated" | "offline-authenticated" | "logging-out" | "error";
 
-const clientBuild = 2;
+const clientBuild = 3;
 const defaultSocketUrl = process.env.EXPO_PUBLIC_SOCKET_URL || process.env.EXPO_PUBLIC_SERVER_URL || "http://10.0.2.2:4000";
 const defaultApiBase = process.env.EXPO_PUBLIC_API_BASE_URL || process.env.EXPO_PUBLIC_SERVER_URL || "http://10.0.2.2:4000";
+const authTimeoutMs = 45_000;
 const errorLimiter = new ErrorLimiter();
 
 export default function App() {
@@ -110,6 +114,7 @@ export default function App() {
   const actions = room?.game?.availableActions ?? null;
   const anyPending = useMemo(() => Object.values(pendingOps).some(Boolean), [pendingOps]);
   const canEditServer = typeof __DEV__ !== "undefined" && __DEV__;
+  const progressLabel = useMemo(() => progressLabelFor(authState, authMode, pendingOps), [authMode, authState, pendingOps]);
 
   useEffect(() => {
     tokenStorage
@@ -144,7 +149,7 @@ export default function App() {
   async function restoreSession(savedToken: string) {
     setAuthState("restoring");
     try {
-      const result = await apiRequest<{ user: unknown }>(apiBase, "/auth/me", { token: savedToken });
+      const result = await apiRequest<{ user: unknown }>(apiBase, "/auth/me", { token: savedToken, timeoutMs: authTimeoutMs, clientBuild });
       await acceptAuth(savedToken, readUser(result.user));
     } catch (error) {
       if (error instanceof AuthExpiredError) {
@@ -166,7 +171,7 @@ export default function App() {
     setLastError("");
     try {
       const path = authMode === "login" ? "/auth/login" : "/auth/register";
-      const result = await apiRequest<{ token: unknown; user: unknown }>(apiBase, path, { body: { username, password, nickname, avatar } });
+      const result = await apiRequest<{ token: unknown; user: unknown }>(apiBase, path, { body: { username, password, nickname, avatar }, timeoutMs: authTimeoutMs, clientBuild });
       await acceptAuth(readToken(result.token), readUser(result.user));
     } catch (error) {
       setAuthState("error");
@@ -182,7 +187,7 @@ export default function App() {
     setAuthState("authenticating");
     setLastError("");
     try {
-      const result = await apiRequest<{ token: unknown; user: unknown }>(apiBase, "/auth/guest", { body: {} });
+      const result = await apiRequest<{ token: unknown; user: unknown }>(apiBase, "/auth/guest", { body: {}, timeoutMs: authTimeoutMs, clientBuild });
       await acceptAuth(readToken(result.token), readUser(result.user));
     } catch (error) {
       setAuthState("error");
@@ -267,7 +272,8 @@ export default function App() {
     }
     setPendingOps((prev) => ({ ...prev, [key]: true }));
     const operationId = `${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}`;
-    socket.timeout(6000).emit(event, { ...payload, operationId }, (error: Error | null, result?: { ok: boolean; error?: string; [key: string]: unknown }) => {
+    const stateVersion = room?.stateVersion;
+    socket.timeout(6000).emit(event, { ...payload, ...(typeof stateVersion === "number" ? { stateVersion } : {}), operationId }, (error: Error | null, result?: { ok: boolean; error?: string; message?: string; [key: string]: unknown }) => {
       if (!mountedRef.current) return;
       setPendingOps((prev) => ({ ...prev, [key]: false }));
       if (error) {
@@ -275,7 +281,7 @@ export default function App() {
         socket.emit("rooms:resume");
         return;
       }
-      if (!result?.ok) return showError(result?.error ?? "操作失败");
+      if (!result?.ok) return showError(result?.message ?? result?.error ?? "操作失败");
       onOk?.(result);
     });
   }
@@ -313,6 +319,7 @@ export default function App() {
         <ScrollView contentContainerStyle={styles.connectPanel}>
           <Text style={styles.title}>德州扑克</Text>
           <Text style={styles.caption}>仅使用虚拟筹码</Text>
+          <ProgressBar label={progressLabel} />
           {canEditServer ? (
             <Pressable style={styles.textButton} onPress={() => setShowServerSettings(!showServerSettings)}>
               <Text style={styles.joinText}>{showServerSettings ? "隐藏服务器设置" : "服务器设置"}</Text>
@@ -365,6 +372,7 @@ export default function App() {
             <Text style={styles.ghostText}>刷新</Text>
           </Pressable>
         </View>
+        <ProgressBar label={progressLabel} />
         <FlatList
           data={rooms}
           keyExtractor={(item) => item.id}
@@ -405,6 +413,7 @@ export default function App() {
           <Text style={styles.ghostText}>离开</Text>
         </Pressable>
       </View>
+      <ProgressBar label={progressLabel} />
 
       <ScrollView contentContainerStyle={styles.tableScroll}>
         <View style={styles.table}>
@@ -526,7 +535,7 @@ function errorMessage(error: unknown): string {
   if (error instanceof TimeoutError) return "请求超时，请稍后重试";
   if (error instanceof ServerError) return "服务暂不可用，请稍后重试";
   if (error instanceof InvalidResponseError) return error.message;
-  return error instanceof Error ? error.message : String(error);
+  return "操作失败，请稍后重试";
 }
 
 function Header({ user, status, onLogout }: { user: User; status: ConnectionStatus; onLogout: () => void }) {
@@ -660,6 +669,14 @@ function zhMessage(message: string): string {
       "Request timed out": "请求超时",
       "Action failed": "操作失败",
       "Request failed": "请求失败",
+      "操作失败，请稍后重试": "操作失败，请稍后重试",
+      "Username can only use 1-32 lowercase letters, numbers, and underscores": "用户名只能使用 1-32 位小写字母、数字和下划线",
+      "Password is too long": "密码太长",
+      "Voice is not available": "语音功能开发中",
+      "Voice unavailable": "语音功能开发中",
+      "牌桌状态已更新，请重试": "牌桌状态已更新，请重试",
+      "语音功能开发中": "语音功能开发中",
+      "服务暂不可用，请稍后重试": "服务暂不可用，请稍后重试",
       "Microphone permission denied": "麦克风权限被拒绝",
       "Cannot leave during a hand": "牌局进行中不能离开房间",
       "Cannot change seats during a hand": "牌局进行中不能换座",
@@ -689,6 +706,9 @@ function zhMessage(message: string): string {
       "Bet must beat the current bet": "下注必须高于当前下注",
       "Raise is below the minimum": "加注低于最小额度",
       "Opening bet is below the minimum": "开局下注低于最小额度",
+      "Invalid action": "操作不合法，请同步牌桌后重试",
+      "Bet must be a safe positive integer": "下注金额必须是安全的正整数",
+      "Player chips must be a safe non-negative integer": "玩家筹码状态异常，请同步牌桌后重试",
       "Deck is empty": "牌堆已空",
       "No next occupied seat": "没有下一个有人的座位",
       "Unauthorized": "登录已失效，请重新登录",

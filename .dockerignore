@@ -4,3 +4,8 @@ server/node_modules
 mobile/node_modules
 data
 *.log
+.env
+.env.*
+*.keystore
+*.jks
+*-passwords.txt

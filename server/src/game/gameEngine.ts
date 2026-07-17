@@ -101,9 +101,12 @@ export class GameEngine {
     };
   }
 
-  startHand(players: StartPlayer[], options: { dealerSeat?: number; deck?: Card[] } = {}): GameState {
+  startHand(players: StartPlayer[], options: { dealerSeat?: number; deck?: Card[]; random?: () => number } = {}): GameState {
     if (players.length < 2) throw new Error("At least two players are required");
     const sorted = [...players].sort((a, b) => a.seat - b.seat);
+    for (const player of sorted) {
+      if (!Number.isSafeInteger(player.chips) || player.chips < 0) throw new Error("Player chips must be a safe non-negative integer");
+    }
     const dealerSeat = options.dealerSeat ?? sorted[0].seat;
     const smallBlindSeat = sorted.length === 2 ? dealerSeat : this.nextSeatFromList(sorted, dealerSeat);
     const bigBlindSeat = this.nextSeatFromList(sorted, smallBlindSeat);
@@ -111,7 +114,7 @@ export class GameEngine {
     this.state = {
       handId: this.state.handId + 1,
       street: "preflop",
-      deck: options.deck ? [...options.deck] : shuffle(makeDeck()),
+      deck: options.deck ? [...options.deck] : shuffle(makeDeck(), options.random),
       board: [],
       players: sorted.map((player) => ({
         ...player,
@@ -154,6 +157,7 @@ export class GameEngine {
   }
 
   executeAction(playerId: string, type: PlayerAction, amount = 0): GameState {
+    if (!isPlayerAction(type)) throw new Error("Invalid action");
     const player = this.state.players.find((candidate) => candidate.id === playerId);
     if (!player) throw new Error("Player is not in this hand");
     if (player.seat !== this.state.currentTurnSeat) throw new Error("It is not this player's turn");
@@ -179,6 +183,8 @@ export class GameEngine {
       this.betTo(player, amount);
     } else if (type === "all-in") {
       this.betTo(player, player.bet + player.chips, true);
+    } else {
+      throw new Error("Invalid action");
     }
 
     this.afterAction(player.seat);
@@ -215,7 +221,7 @@ export class GameEngine {
 
   private betTo(player: EnginePlayer, targetBet: number, allIn = false): void {
     const maxBet = player.bet + player.chips;
-    const nextBet = Math.min(Math.floor(targetBet), maxBet);
+    const nextBet = Math.min(readBetTarget(targetBet), maxBet);
     if (nextBet <= player.bet) throw new Error("Bet must add chips");
     if (!allIn && targetBet > maxBet) throw new Error("Not enough chips");
 
@@ -334,6 +340,7 @@ export class GameEngine {
   }
 
   private contribute(seat: number, amount: number): number {
+    if (!Number.isSafeInteger(amount) || amount < 0) throw new Error("Bet must be a safe positive integer");
     const player = this.playerAt(seat);
     const paid = Math.min(player.chips, amount);
     player.chips -= paid;
@@ -492,4 +499,13 @@ function normalizeGameRules(input: Partial<GameRules> | { small: number; big: nu
 function positiveInt(value: unknown, fallback: number): number {
   const number = Math.floor(Number(value));
   return Number.isFinite(number) && number > 0 ? number : fallback;
+}
+
+function isPlayerAction(value: unknown): value is PlayerAction {
+  return value === "fold" || value === "check" || value === "call" || value === "bet" || value === "raise" || value === "all-in";
+}
+
+function readBetTarget(value: number): number {
+  if (!Number.isSafeInteger(value) || value <= 0) throw new Error("Bet must be a safe positive integer");
+  return value;
 }

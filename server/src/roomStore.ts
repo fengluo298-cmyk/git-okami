@@ -32,6 +32,7 @@ export type Room = {
   name: string;
   ownerId: string;
   status: RoomStatus;
+  version: number;
   seats: Array<RoomSeat | null>;
   members: Set<string>;
   voice: Map<string, { muted: boolean; speaking: boolean }>;
@@ -46,6 +47,7 @@ export type PublicRoom = {
   name: string;
   ownerId: string;
   status: RoomStatus;
+  stateVersion: number;
   rules: RoomRules;
   seats: Array<RoomSeat | null>;
   voice: Array<{ userId: string; nickname: string; muted: boolean; speaking: boolean }>;
@@ -76,6 +78,7 @@ export class RoomStore {
       name: (name ?? "").trim().slice(0, 24) || `${owner.nickname}的牌桌`,
       ownerId: owner.id,
       status: "lobby",
+      version: 1,
       seats: Array.from({ length: fullRules.maxPlayers }, () => null),
       members: new Set([owner.id]),
       voice: new Map(),
@@ -96,6 +99,7 @@ export class RoomStore {
     room.members.add(user.id);
     this.userRoom.set(user.id, room.id);
     this.markConnected(user.id, true);
+    this.touch(room);
     return room;
   }
 
@@ -109,6 +113,7 @@ export class RoomStore {
     room.members.delete(userId);
     this.userRoom.delete(userId);
     if (room.ownerId === userId) room.ownerId = room.seats.find(Boolean)?.id ?? [...room.members][0] ?? "";
+    this.touch(room);
     if (room.members.size === 0 || !room.ownerId) this.rooms.delete(room.id);
     return room;
   }
@@ -123,7 +128,7 @@ export class RoomStore {
       room.seats[existing.seat] = null;
       existing.seat = seatNumber;
       room.seats[seatNumber] = existing;
-      return room;
+      return this.touch(room);
     }
     if (buyIn < room.rules.minBuyIn || buyIn > room.rules.maxBuyIn) throw new Error(`Buy-in must be ${room.rules.minBuyIn}-${room.rules.maxBuyIn}`);
     this.db.adjustUserChips(user.id, -buyIn, "buy_in", room.id);
@@ -136,7 +141,7 @@ export class RoomStore {
       ready: false,
       connected: true
     };
-    return room;
+    return this.touch(room);
   }
 
   leaveSeat(userId: string): Room {
@@ -145,7 +150,7 @@ export class RoomStore {
     const seat = room.seats.find((candidate) => candidate?.id === userId);
     if (seat) this.cashOutSeat(room, seat);
     room.voice.delete(userId);
-    return room;
+    return this.touch(room);
   }
 
   setReady(userId: string, ready: boolean): Room {
@@ -154,7 +159,7 @@ export class RoomStore {
     const seat = room.seats.find((candidate) => candidate?.id === userId);
     if (!seat) throw new Error("Sit down first");
     seat.ready = ready;
-    return room;
+    return this.touch(room);
   }
 
   startGame(userId: string): Room {
@@ -175,7 +180,7 @@ export class RoomStore {
         seat.handStartChips = seat.chips;
       }
     }
-    return room;
+    return this.touch(room);
   }
 
   action(userId: string, type: PlayerAction, amount?: number): Room {
@@ -186,7 +191,7 @@ export class RoomStore {
       room.status = "finished";
       this.syncFinishedHand(room);
     }
-    return room;
+    return this.touch(room);
   }
 
   autoAction(roomId: string): Room {
@@ -198,7 +203,7 @@ export class RoomStore {
       room.status = "finished";
       this.syncFinishedHand(room);
     }
-    return room;
+    return this.touch(room);
   }
 
   markConnected(userId: string, connected: boolean): Room | null {
@@ -207,7 +212,7 @@ export class RoomStore {
     const seat = room.seats.find((candidate) => candidate?.id === userId);
     if (seat) seat.connected = connected;
     room.engine?.updateConnection(userId, connected);
-    return room;
+    return seat ? this.touch(room) : room;
   }
 
   currentRoom(userId: string): Room | null {
@@ -222,6 +227,7 @@ export class RoomStore {
       name: room.name,
       ownerId: room.ownerId,
       status: room.status,
+      stateVersion: room.version,
       rules: room.rules,
       seats: room.seats,
       voice: [...room.voice.entries()].map(([userId, state]) => ({
@@ -241,13 +247,13 @@ export class RoomStore {
     const room = this.mustCurrentRoom(userId);
     if (!room.members.has(userId)) throw new Error("Join the room first");
     room.voice.set(userId, room.voice.get(userId) ?? { muted: false, speaking: false });
-    return room;
+    return this.touch(room);
   }
 
   leaveVoice(userId: string): Room {
     const room = this.mustCurrentRoom(userId);
     room.voice.delete(userId);
-    return room;
+    return this.touch(room);
   }
 
   setVoiceMuted(userId: string, muted: boolean): Room {
@@ -255,7 +261,7 @@ export class RoomStore {
     const state = room.voice.get(userId);
     if (!state) throw new Error("Join voice first");
     room.voice.set(userId, { ...state, muted, speaking: muted ? false : state.speaking });
-    return room;
+    return this.touch(room);
   }
 
   setVoiceSpeaking(userId: string, speaking: boolean): Room {
@@ -263,7 +269,7 @@ export class RoomStore {
     const state = room.voice.get(userId);
     if (!state) throw new Error("Join voice first");
     room.voice.set(userId, { ...state, speaking: state.muted ? false : speaking });
-    return room;
+    return this.touch(room);
   }
 
   private syncFinishedHand(room: Room): void {
@@ -300,6 +306,17 @@ export class RoomStore {
   private mustRoom(roomId: string): Room {
     const room = this.rooms.get(roomId);
     if (!room) throw new Error("Room not found");
+    return room;
+  }
+
+  assertFresh(userId: string, stateVersion: unknown): void {
+    if (stateVersion === undefined) return;
+    const room = this.mustCurrentRoom(userId);
+    if (!Number.isSafeInteger(stateVersion) || stateVersion !== room.version) throw new Error("State version is stale");
+  }
+
+  private touch(room: Room): Room {
+    room.version += 1;
     return room;
   }
 }

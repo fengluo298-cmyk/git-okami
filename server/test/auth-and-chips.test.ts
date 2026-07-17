@@ -35,6 +35,16 @@ test("client build gate rejects old app versions", () => {
   assert.throws(() => requireClientBuild(undefined, 2), /Client version/);
   assert.throws(() => requireClientBuild(1, 2), /Client version/);
   assert.doesNotThrow(() => requireClientBuild(2, 2));
+  assert.throws(() => requireClientBuild(2, 3), /Client version/);
+  assert.doesNotThrow(() => requireClientBuild(3, 3));
+});
+
+test("register validates username shape and password length", async () => {
+  const db = testDb();
+
+  await assert.rejects(() => register(db, { username: "bad name", password: "secret1" }), /Username can only use/);
+  await assert.rejects(() => register(db, { username: "a".repeat(33), password: "secret1" }), /Username can only use/);
+  await assert.rejects(() => register(db, { username: "valid_name", password: "x".repeat(129) }), /Password is too long/);
 });
 
 test("buy-in removes bank chips and cash-out restores table chips once", async () => {
@@ -79,6 +89,29 @@ test("hand settlement logs table win and loss without changing bank chips", asyn
   assert.equal(db.getUser(b.id)?.chips, 9000);
   assert.equal(db.getChipTransactions(a.id).some((tx) => tx.type === "lose_bet" && tx.amount < 0), true);
   assert.equal(db.getChipTransactions(b.id).some((tx) => tx.type === "win_pot" && tx.amount > 0), true);
+});
+
+test("sqlite file keeps users after database reopen", async () => {
+  const file = join(mkdtempSync(join(tmpdir(), "holdem-")), "persist.db");
+  const first = new AppDatabase(file);
+  const { user } = await register(first, { username: "persist", password: "secret1", nickname: "Persist" });
+  first.close();
+
+  const second = new AppDatabase(file);
+  assert.equal(second.getUser(user.id)?.username, "persist");
+  second.close();
+});
+
+test("production database refuses temp and memory paths", () => {
+  const original = process.env.NODE_ENV;
+  process.env.NODE_ENV = "production";
+  try {
+    assert.throws(() => new AppDatabase("/tmp/holdem.db"), /must not use \/tmp/);
+    assert.throws(() => new AppDatabase(":memory:"), /in-memory/);
+  } finally {
+    if (original === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = original;
+  }
 });
 
 function testDb(): AppDatabase {
