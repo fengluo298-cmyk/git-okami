@@ -5,6 +5,9 @@ on:
   push:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
   check:
     runs-on: ubuntu-latest
@@ -14,7 +17,12 @@ jobs:
         with:
           node-version: 24
           cache: npm
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
       - run: npm ci
+      - run: git diff --check
       - name: Secret file guard
         run: |
           blocked="$(git ls-files | grep -Ei '(^|/)(\.env(\..*)?|.*\.keystore|.*\.jks|.*-passwords\.txt)$' | grep -v '^\.env\.example$' || true)"
@@ -28,3 +36,6 @@ jobs:
       - run: npm run typecheck
       - run: npm run check
       - run: npm audit --audit-level=high
+      - name: Android clean debug build
+        working-directory: mobile/android
+        run: chmod +x ./gradlew && ./gradlew clean assembleDebug --stacktrace --no-daemon

@@ -45,7 +45,7 @@ data/holdem.db
 Override it:
 
 ```bat
-set DATABASE_URL=./data/holdem.db
+set DATABASE_PATH=./data/holdem.db
 ```
 
 Production must use a durable SQLite file. The server refuses `:memory:` and `/tmp/*` when `NODE_ENV=production`.
@@ -67,7 +67,7 @@ Restore:
 cp /var/data/holdem-backup.db /var/data/holdem.db
 ```
 
-For Render, attach a persistent disk mounted at `/var/data` before using `DATABASE_URL=/var/data/holdem.db`. Do not use `/tmp/holdem.db` for production data.
+For Render, attach a persistent disk mounted at `/var/data` before using `DATABASE_PATH=/var/data/holdem.db`. Do not use `/tmp/holdem.db` for production data.
 
 ## Backend
 
@@ -75,7 +75,7 @@ For Render, attach a persistent disk mounted at `/var/data` before using `DATABA
 cd E:/Git/texas-holdem-mobile
 npm ci
 set JWT_SECRET=replace-with-a-long-random-secret
-set DATABASE_URL=./data/holdem.db
+set DATABASE_PATH=./data/holdem.db
 npm run dev:server
 ```
 
@@ -93,7 +93,7 @@ Socket.IO requires:
 auth: { token: "JWT" }
 ```
 
-Current HTTP auth and Socket clients must send `clientBuild >= MIN_CLIENT_BUILD`:
+Current HTTP auth and Socket clients must send `clientBuild >= MIN_CLIENT_BUILD`. Keep `MIN_CLIENT_BUILD=2` until the build 3 APK is verified and downloadable:
 
 ```js
 auth: { token: "JWT", clientBuild: 3 }
@@ -114,7 +114,7 @@ Set env vars like this:
 ```text
 NODE_ENV=production
 JWT_SECRET=<long-random-secret>
-DATABASE_URL=/var/data/holdem.db
+DATABASE_PATH=/var/data/holdem.db
 CORS_ORIGIN=https://git-okami.onrender.com
 SOCKET_CORS_ORIGIN=https://git-okami.onrender.com
 DEFAULT_CHIPS=10000
@@ -124,13 +124,29 @@ DEFAULT_MIN_BUY_IN=1000
 DEFAULT_MAX_BUY_IN=10000
 DEFAULT_MAX_PLAYERS=6
 DEFAULT_ACTION_TIMEOUT_SECONDS=30
-MIN_CLIENT_BUILD=3
+MIN_CLIENT_BUILD=2
+LATEST_CLIENT_VERSION=1.0.2
+CLIENT_DOWNLOAD_URL=
+EXPO_PUBLIC_ALLOWED_DOWNLOAD_HOSTS=git-okami.onrender.com,github.com,github-releases.githubusercontent.com,objects.githubusercontent.com
 VOICE_PROVIDER=none
 ```
 
-Do not set `DATABASE_URL=DATABASE_URL=...`. Do not use a Windows path such as `E:\Git\...` on Render.
+Do not set `DATABASE_PATH=DATABASE_PATH=...`. Do not use a Windows path such as `E:\Git\...` on Render.
 
 `/tmp/holdem.db` is blocked in production because it is not durable across restarts. Use a Render persistent disk with a Linux path like `/var/data/holdem.db`, or migrate to PostgreSQL before production traffic depends on persisted chips.
+
+`MIN_CLIENT_BUILD=2` is a local development default. In `NODE_ENV=production`, the server refuses to start unless `MIN_CLIENT_BUILD` is explicitly set to a valid non-negative integer. The Render Blueprint leaves this value as `sync: false`; set it manually in the Render Dashboard.
+
+Client upgrade rollout:
+
+1. Build the new APK.
+2. Verify the new APK locally and on a phone.
+3. Put the APK at a real `CLIENT_DOWNLOAD_URL`.
+   If that URL is not on GitHub or `git-okami.onrender.com`, include its host in `EXPO_PUBLIC_ALLOWED_DOWNLOAD_HOSTS` before building the APK.
+4. Deploy the server while `MIN_CLIENT_BUILD` still allows the old build.
+5. Verify build 3 can register, log in, connect Socket, and finish a minimal hand.
+6. Raise `MIN_CLIENT_BUILD` to `3`.
+7. Roll back by lowering `MIN_CLIENT_BUILD` to `2` if users cannot upgrade.
 
 ## Frontend
 
@@ -299,7 +315,7 @@ Important variables:
 API_BASE_URL
 SOCKET_URL
 JWT_SECRET
-DATABASE_URL
+DATABASE_PATH
 VOICE_APP_ID
 VOICE_APP_SECRET
 EXPO_PUBLIC_API_BASE_URL

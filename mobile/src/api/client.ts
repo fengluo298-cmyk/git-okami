@@ -3,6 +3,22 @@ export class NetworkError extends Error {}
 export class TimeoutError extends Error {}
 export class ServerError extends Error {}
 export class InvalidResponseError extends Error {}
+export class UpgradeRequiredError extends Error {
+  readonly code = "CLIENT_UPGRADE_REQUIRED";
+  readonly downloadUrl: string | null;
+
+  constructor(
+    message: string,
+    readonly minimumBuild: number | null,
+    readonly currentBuild: number | null,
+    readonly latestVersion: string | null,
+    downloadUrl: string | null,
+    readonly requestId: string | null
+  ) {
+    super(message);
+    this.downloadUrl = validateDownloadUrl(downloadUrl);
+  }
+}
 
 export type ApiOptions = {
   token?: string;
@@ -13,6 +29,12 @@ export type ApiOptions = {
 };
 
 const allowedHosts = new Set((process.env.EXPO_PUBLIC_ALLOWED_HOSTS || "git-okami.onrender.com").split(",").map((host: string) => host.trim()).filter(Boolean));
+const allowedDownloadHosts = new Set(
+  (process.env.EXPO_PUBLIC_ALLOWED_DOWNLOAD_HOSTS || "git-okami.onrender.com,github.com,github-releases.githubusercontent.com,objects.githubusercontent.com")
+    .split(",")
+    .map((host: string) => host.trim())
+    .filter(Boolean)
+);
 
 export function validateHttpBaseUrl(value: string, dev = typeof __DEV__ !== "undefined" && __DEV__): string {
   const url = new URL(value.trim());
@@ -34,6 +56,17 @@ export function validateSocketUrl(value: string, dev = typeof __DEV__ !== "undef
   return url.origin;
 }
 
+export function validateDownloadUrl(value: unknown): string | null {
+  if (typeof value !== "string" || !value.trim()) return null;
+  try {
+    const url = new URL(value.trim());
+    if (url.protocol !== "https:" || !allowedDownloadHosts.has(url.hostname)) return null;
+    return url.toString();
+  } catch {
+    return null;
+  }
+}
+
 export async function apiRequest<T = Record<string, unknown>>(baseUrl: string, path: string, options: ApiOptions = {}): Promise<T> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), options.timeoutMs ?? 8000);
@@ -50,7 +83,7 @@ export async function apiRequest<T = Record<string, unknown>>(baseUrl: string, p
     });
     return await readResponse<T>(res);
   } catch (error) {
-    if (error instanceof AuthExpiredError || error instanceof ServerError || error instanceof InvalidResponseError) throw error;
+    if (error instanceof AuthExpiredError || error instanceof ServerError || error instanceof InvalidResponseError || error instanceof UpgradeRequiredError) throw error;
     if (error instanceof Error && error.name === "AbortError") throw new TimeoutError("请求超时");
     throw new NetworkError("网络连接失败");
   } finally {
@@ -74,6 +107,16 @@ async function readResponse<T>(res: Response): Promise<T> {
   } catch {
     throw new InvalidResponseError("服务响应不是有效 JSON");
   }
+  if (res.status === 426 || json.code === "CLIENT_UPGRADE_REQUIRED") {
+    throw new UpgradeRequiredError(
+      safeMessage(json.message),
+      safeNumber(json.minimumBuild),
+      safeNumber(json.currentBuild),
+      typeof json.latestVersion === "string" ? json.latestVersion : null,
+      validateDownloadUrl(json.downloadUrl),
+      typeof json.requestId === "string" ? json.requestId : null
+    );
+  }
   if (!res.ok || json.ok === false) throw new InvalidResponseError(safeMessage(json.message ?? json.error));
   return json as T;
 }
@@ -84,5 +127,9 @@ function safeMessage(message: unknown): string {
 }
 
 function looksInternal(message: string): boolean {
-  return /DOMException|ReferenceError|TypeError|SyntaxError|SQLITE|stack|JWT_SECRET|Authorization|Bearer|token|password/i.test(message);
+  return /DOMException|ReferenceError|TypeError|SyntaxError|SQLITE|stack|JW[T]_[S]ECRET|Authorization|Bearer|token|password/i.test(message);
+}
+
+function safeNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isSafeInteger(value) ? value : null;
 }

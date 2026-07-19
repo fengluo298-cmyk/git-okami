@@ -25,6 +25,7 @@ export type ChipTransaction = {
 };
 
 const DEFAULT_CHIPS = positiveInt(process.env.DEFAULT_CHIPS, 10000);
+const CURRENT_SCHEMA_VERSION = 1;
 
 export class AppDatabase {
   private readonly db: DatabaseSync;
@@ -33,6 +34,9 @@ export class AppDatabase {
     assertDurableDatabaseFile(file);
     if (file !== ":memory:") mkdirSync(dirname(file), { recursive: true });
     this.db = new DatabaseSync(file);
+    this.db.exec("pragma foreign_keys = on");
+    this.db.exec("pragma busy_timeout = 5000");
+    if (file !== ":memory:") this.db.exec("pragma journal_mode = WAL");
     this.migrate();
   }
 
@@ -43,6 +47,7 @@ export class AppDatabase {
         applied_at text not null default current_timestamp
       );
     `);
+    this.assertKnownSchemaVersion();
     this.applyMigration(1, `
       create table if not exists users (
         id text primary key,
@@ -72,6 +77,7 @@ export class AppDatabase {
     this.addColumnIfMissing("users", "avatar_url", "text");
     if (this.hasColumn("users", "avatar")) this.db.exec("update users set avatar_url = avatar where avatar_url is null");
     this.db.exec("create unique index if not exists idx_users_username on users(username) where username is not null");
+    this.assertKnownSchemaVersion();
   }
 
   close(): void {
@@ -191,6 +197,11 @@ export class AppDatabase {
       throw error;
     }
   }
+
+  private assertKnownSchemaVersion(): void {
+    const row = this.db.prepare("select max(version) as version from schema_migrations").get() as { version: number | null };
+    if ((row.version ?? 0) > CURRENT_SCHEMA_VERSION) throw new Error("Database schema is newer than this server");
+  }
 }
 
 function cleanNickname(nickname?: string): string {
@@ -210,10 +221,12 @@ function stripPassword(user: UserRecord & { passwordHash: string | null }): User
 }
 
 export function databaseFile(): string {
-  let file = process.env.DATABASE_URL ?? process.env.DB_FILE ?? "";
-  while (file.startsWith("DATABASE_URL=")) file = file.slice("DATABASE_URL=".length);
+  let file = process.env.DATABASE_PATH ?? process.env.DATABASE_URL ?? process.env.DB_FILE ?? "";
+  while (file.startsWith("DATABASE_PATH=") || file.startsWith("DATABASE_URL=")) {
+    file = file.replace(/^DATABASE_(PATH|URL)=/, "");
+  }
   if (!file || (process.platform !== "win32" && /^[A-Za-z]:[\\/]/.test(file))) {
-    if (isProduction()) throw new Error("DATABASE_URL must point to a durable SQLite file in production");
+    if (isProduction()) throw new Error("DATABASE_PATH must point to a durable SQLite file in production");
     file = resolve(process.cwd(), "data", "holdem.db");
   }
   return file;
@@ -222,9 +235,9 @@ export function databaseFile(): string {
 export function assertDurableDatabaseFile(file: string): void {
   if (!isProduction()) return;
   const normalized = file.replace(/\\/g, "/");
-  if (normalized === ":memory:" || normalized.includes("mode=memory")) throw new Error("DATABASE_URL must not use an in-memory database in production");
+  if (normalized === ":memory:" || normalized.includes("mode=memory")) throw new Error("DATABASE_PATH must not use an in-memory database in production");
   if (normalized === "/tmp/holdem.db" || normalized.startsWith("/tmp/")) {
-    throw new Error("DATABASE_URL must not use /tmp in production; configure a persistent disk path such as /var/data/holdem.db");
+    throw new Error("DATABASE_PATH must not use /tmp in production; configure a persistent disk path such as /var/data/holdem.db");
   }
 }
 

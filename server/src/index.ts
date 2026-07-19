@@ -1,17 +1,19 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
 import { Server, type Socket } from "socket.io";
-import { guestLogin, login, register, requireClientBuild, signVoiceToken, verifyToken } from "./auth.js";
+import { ClientUpgradeRequiredError, guestLogin, login, readMinimumClientBuild, register, requireClientBuild, signVoiceToken, verifyToken } from "./auth.js";
 import { AppDatabase, type UserRecord } from "./db.js";
 import { RoomStore, type Room, type RoomRules } from "./roomStore.js";
 import type { PlayerAction } from "./game/gameEngine.js";
 import { parseChipAmount } from "./amount.js";
-import { OperationDeduper, type AckResult } from "./operations.js";
+import { OperationDeduper, RoomActionQueue, type AckResult } from "./operations.js";
 
 const port = Number(process.env.PORT ?? 4000);
 const corsOrigin = readCorsOrigin("CORS_ORIGIN");
 const socketCorsOrigin = process.env.SOCKET_CORS_ORIGIN ?? corsOrigin;
-const minClientBuild = Number(process.env.MIN_CLIENT_BUILD ?? 3);
+const minClientBuild = readMinimumClientBuild();
+const latestClientVersion = process.env.LATEST_CLIENT_VERSION ?? "1.0.2";
+const clientDownloadUrl = process.env.CLIENT_DOWNLOAD_URL?.trim() || null;
 const maxJsonBytes = Number(process.env.MAX_JSON_BYTES ?? 16_384);
 const voiceEnabled = (process.env.VOICE_PROVIDER ?? "none") !== "none";
 const db = new AppDatabase();
@@ -19,7 +21,7 @@ const rooms = new RoomStore(db);
 const actionTimers = new Map<string, NodeJS.Timeout>();
 const operations = new OperationDeduper();
 const authLimiter = rateLimiter(20, 15 * 60_000);
-const roomLocks = new Set<string>();
+const roomLocks = new RoomActionQueue();
 
 process.on("unhandledRejection", (reason) => {
   console.error(JSON.stringify({ level: "error", event: "unhandledRejection", message: safeLogMessage(reason) }));
@@ -39,25 +41,26 @@ const httpServer = createServer(async (req, res) => {
     if (req.method === "GET" && url.pathname === "/") return sendJson(res, 200, { ok: true, service: "texas-holdem-server" }, requestId);
     if (req.method === "GET" && url.pathname === "/health") return sendJson(res, 200, { ok: true, status: "ok" }, requestId);
     if (req.method === "GET" && url.pathname === "/ready") return sendJson(res, 200, { ok: true, status: "ready" }, requestId);
+    if (req.method === "GET" && url.pathname === "/client-version") return sendJson(res, 200, { ok: true, minimumBuild: minClientBuild, latestVersion: latestClientVersion, downloadUrl: clientDownloadUrl }, requestId);
     if (req.method === "POST" && url.pathname === "/auth/register") {
-      requireClientBuild(headerClientBuild(req), minClientBuild);
+      requireClientBuild(headerClientBuild(req), minClientBuild, clientVersionMeta());
       const body = await readJson(req);
       checkAuthLimit(req, body.username);
       return sendJson(res, 200, { ok: true, ...(await register(db, body)) }, requestId);
     }
     if (req.method === "POST" && url.pathname === "/auth/login") {
-      requireClientBuild(headerClientBuild(req), minClientBuild);
+      requireClientBuild(headerClientBuild(req), minClientBuild, clientVersionMeta());
       const body = await readJson(req);
       checkAuthLimit(req, body.username);
       return sendJson(res, 200, { ok: true, ...(await login(db, body)) }, requestId);
     }
     if (req.method === "POST" && url.pathname === "/auth/guest") {
-      requireClientBuild(headerClientBuild(req), minClientBuild);
+      requireClientBuild(headerClientBuild(req), minClientBuild, clientVersionMeta());
       checkAuthLimit(req, "guest");
       return sendJson(res, 200, { ok: true, ...guestLogin(db, await readJson(req)) }, requestId);
     }
     if (req.method === "GET" && url.pathname === "/auth/me") {
-      requireClientBuild(headerClientBuild(req), minClientBuild);
+      requireClientBuild(headerClientBuild(req), minClientBuild, clientVersionMeta());
       return sendJson(res, 200, { ok: true, user: verifyToken(db, bearer(req)) }, requestId);
     }
     return sendError(res, requestId, apiError("NOT_FOUND", "未找到", 404));
@@ -78,11 +81,15 @@ const io = new Server(httpServer, {
 io.use((socket, next) => {
   try {
     const auth = socket.handshake.auth as { token?: string; clientBuild?: number };
-    requireClientBuild(auth.clientBuild, minClientBuild);
+    requireClientBuild(auth.clientBuild, minClientBuild, clientVersionMeta());
     socket.data.user = verifyToken(db, auth.token);
     next();
   } catch (error) {
-    next(error instanceof Error ? error : new Error("Unauthorized"));
+    const requestId = randomUUID();
+    const publicError = toPublicError(error);
+    const socketError = new Error(publicError.message) as Error & { data?: Record<string, unknown> };
+    socketError.data = errorPayload(publicError, requestId);
+    next(socketError);
   }
 });
 
@@ -96,7 +103,7 @@ io.on("connection", (socket: Socket) => {
   socket.on("rooms:resume", () => resumeRoom(socket, user));
 
   socket.on("rooms:create", (payload: { name?: string; rules?: Partial<RoomRules>; operationId?: string } = {}, ack?: Ack) =>
-    handle(socket, ack, payload, () => {
+    handle("rooms:create", socket, ack, payload, () => {
       const room = rooms.createRoom(user, payload.name, payload.rules);
       socket.join(room.id);
       socket.emit("room:state", rooms.publicRoom(room.id, user.id));
@@ -106,7 +113,7 @@ io.on("connection", (socket: Socket) => {
   );
 
   socket.on("rooms:join", (payload: { roomId: string; operationId?: string }, ack?: Ack) =>
-    handle(socket, ack, payload, () => {
+    handle("rooms:join", socket, ack, payload, () => {
       const room = rooms.joinRoom(user, payload.roomId);
       socket.join(room.id);
       emitRoom(room);
@@ -116,7 +123,7 @@ io.on("connection", (socket: Socket) => {
   );
 
   socket.on("rooms:leave", (payload: { operationId?: string; stateVersion?: number } = {}, ack?: Ack) =>
-    handle(socket, ack, payload, () => {
+    handle("rooms:leave", socket, ack, payload, () => {
       const room = rooms.leaveRoom(user.id);
       if (room) socket.leave(room.id);
       socket.emit("room:state", null);
@@ -128,7 +135,7 @@ io.on("connection", (socket: Socket) => {
   );
 
   socket.on("seat:sit", (payload: { seat: number; buyIn?: number | string; operationId?: string; stateVersion?: number }, ack?: Ack) =>
-    handle(socket, ack, payload, () => {
+    handle("seat:sit", socket, ack, payload, () => {
       const current = rooms.currentRoom(user.id);
       const buyIn = parseChipAmount(payload.buyIn ?? current?.rules.minBuyIn ?? 1000, "Buy-in");
       const room = rooms.sit(user, payload.seat, buyIn);
@@ -140,7 +147,7 @@ io.on("connection", (socket: Socket) => {
   );
 
   socket.on("seat:leave", (payload: { operationId?: string; stateVersion?: number } = {}, ack?: Ack) =>
-    handle(socket, ack, payload, () => {
+    handle("seat:leave", socket, ack, payload, () => {
       const room = rooms.leaveSeat(user.id);
       refreshSession(socket);
       emitRoom(room);
@@ -150,7 +157,7 @@ io.on("connection", (socket: Socket) => {
   );
 
   socket.on("seat:ready", (payload: { ready: boolean; operationId?: string; stateVersion?: number }, ack?: Ack) =>
-    handle(socket, ack, payload, () => {
+    handle("seat:ready", socket, ack, payload, () => {
       const room = rooms.setReady(user.id, Boolean(payload.ready));
       emitRoom(room);
       return {};
@@ -158,7 +165,7 @@ io.on("connection", (socket: Socket) => {
   );
 
   socket.on("game:start", (payload: { operationId?: string; stateVersion?: number } = {}, ack?: Ack) =>
-    handle(socket, ack, payload, () => {
+    handle("game:start", socket, ack, payload, () => {
       const room = rooms.startGame(user.id);
       emitRoom(room);
       emitRooms();
@@ -168,7 +175,7 @@ io.on("connection", (socket: Socket) => {
   );
 
   socket.on("game:action", (payload: { type: PlayerAction; amount?: number | string; operationId?: string; stateVersion?: number }, ack?: Ack) =>
-    handle(socket, ack, payload, () => {
+    handle("game:action", socket, ack, payload, () => {
       const amount = payload.amount === undefined ? undefined : parseChipAmount(payload.amount, "Bet");
       const room = rooms.action(user.id, payload.type, amount);
       emitRoom(room);
@@ -179,7 +186,7 @@ io.on("connection", (socket: Socket) => {
   );
 
   socket.on("voice:join", (payload: { operationId?: string } = {}, ack?: Ack) =>
-    handle(socket, ack, payload, () => {
+    handle("voice:join", socket, ack, payload, () => {
       if (!voiceEnabled) throw new Error("Voice is not available");
       const room = rooms.joinVoice(user.id);
       emitRoom(room);
@@ -188,7 +195,7 @@ io.on("connection", (socket: Socket) => {
   );
 
   socket.on("voice:leave", (payload: { operationId?: string } = {}, ack?: Ack) =>
-    handle(socket, ack, payload, () => {
+    handle("voice:leave", socket, ack, payload, () => {
       if (!voiceEnabled) throw new Error("Voice is not available");
       const room = rooms.leaveVoice(user.id);
       emitRoom(room);
@@ -197,7 +204,7 @@ io.on("connection", (socket: Socket) => {
   );
 
   socket.on("voice:mute", (payload: { muted: boolean; operationId?: string }, ack?: Ack) =>
-    handle(socket, ack, payload, () => {
+    handle("voice:mute", socket, ack, payload, () => {
       if (!voiceEnabled) throw new Error("Voice is not available");
       const room = rooms.setVoiceMuted(user.id, Boolean(payload.muted));
       emitRoom(room);
@@ -206,7 +213,7 @@ io.on("connection", (socket: Socket) => {
   );
 
   socket.on("voice:speaking", (payload: { speaking: boolean; operationId?: string }, ack?: Ack) =>
-    handle(socket, ack, payload, () => {
+    handle("voice:speaking", socket, ack, payload, () => {
       if (!voiceEnabled) throw new Error("Voice is not available");
       const room = rooms.setVoiceSpeaking(user.id, Boolean(payload.speaking));
       emitRoom(room);
@@ -227,23 +234,42 @@ httpServer.listen(port, "0.0.0.0", () => {
 type Ack = (result: AckResult) => void;
 type HandleOptions = { checkStateVersion?: boolean; lockRoom?: boolean };
 
-function handle(socket: Socket, ack: Ack | undefined, payload: { operationId?: unknown; stateVersion?: unknown }, work: () => Record<string, unknown>, options: HandleOptions = {}): void {
+async function handle(event: string, socket: Socket, ack: Ack | undefined, payload: { actionId?: unknown; operationId?: unknown; stateVersion?: unknown }, work: () => Record<string, unknown>, options: HandleOptions = {}): Promise<void> {
   const user = socket.data.user as UserRecord;
   const requestId = randomUUID();
-  const cached = operations.get(user.id, payload.operationId);
-  if (cached) {
-    ack?.(cached);
-    return;
-  }
   try {
+    const actionId = payload.actionId ?? payload.operationId;
+    const scope = operations.scope({
+      userId: user.id,
+      roomId: rooms.currentRoom(user.id)?.id ?? "lobby",
+      actionId,
+      event,
+      payload
+    });
+    const cached = operations.get(scope);
+    if (cached) {
+      ack?.(cached);
+      return;
+    }
     if (options.checkStateVersion) rooms.assertFresh(user.id, payload.stateVersion);
-    const result = withRoomLock(user.id, options.lockRoom, () => ({ ok: true, ...work(), stateVersion: rooms.currentRoom(user.id)?.version }));
-    operations.set(user.id, payload.operationId, result);
+    const result = await withRoomLock(user.id, options.lockRoom, () => {
+      const output = work();
+      const currentRoom = rooms.currentRoom(user.id);
+      return {
+        ok: true,
+        code: "OK",
+        actionId: scope.actionId,
+        ...output,
+        stateVersion: currentRoom?.version,
+        state: currentRoom ? rooms.publicRoom(currentRoom.id, user.id) : null
+      };
+    });
+    operations.set(scope, result);
+    if (scope.roomId !== "lobby" && !rooms.roomById(scope.roomId)) operations.deleteRoom(scope.roomId);
     ack?.(result);
   } catch (error) {
     const publicError = toPublicError(error);
-    const result = { ok: false, code: publicError.code, message: publicError.message, error: publicError.message, requestId, stateVersion: rooms.currentRoom(user.id)?.version };
-    operations.set(user.id, payload.operationId, result);
+    const result = { ...errorPayload(publicError, requestId), stateVersion: rooms.currentRoom(user.id)?.version };
     socket.emit("error:message", { message: publicError.message, code: publicError.code, requestId });
     ack?.(result);
   }
@@ -315,7 +341,7 @@ function sendJson(res: ServerResponse, status: number, body: Record<string, unkn
 }
 
 function sendError(res: ServerResponse, requestId: string, error: PublicError): void {
-  sendJson(res, error.status, { ok: false, code: error.code, message: error.message, error: error.message }, requestId);
+  sendJson(res, error.status, errorPayload(error, requestId), requestId);
 }
 
 function setCors(req: IncomingMessage, res: ServerResponse): void {
@@ -323,7 +349,7 @@ function setCors(req: IncomingMessage, res: ServerResponse): void {
   const allowed = chooseCorsOrigin(origin);
   if (allowed) res.setHeader("access-control-allow-origin", allowed);
   res.setHeader("access-control-allow-methods", "GET,POST,OPTIONS");
-  res.setHeader("access-control-allow-headers", "content-type,authorization");
+  res.setHeader("access-control-allow-headers", "content-type,authorization,x-client-build");
 }
 
 function bearer(req: IncomingMessage): string | undefined {
@@ -331,20 +357,29 @@ function bearer(req: IncomingMessage): string | undefined {
   return header.startsWith("Bearer ") ? header.slice(7) : undefined;
 }
 
-function headerClientBuild(req: IncomingMessage): number {
-  return Number(req.headers["x-client-build"] ?? 0);
+function headerClientBuild(req: IncomingMessage): unknown {
+  return req.headers["x-client-build"];
 }
 
-type PublicError = Error & { code: string; status: number };
+type PublicError = Error & { code: string; status: number; details?: Record<string, unknown> };
 
-function apiError(code: string, message: string, status: number): PublicError {
+function apiError(code: string, message: string, status: number, details?: Record<string, unknown>): PublicError {
   const error = new Error(message) as PublicError;
   error.code = code;
   error.status = status;
+  error.details = details;
   return error;
 }
 
 function toPublicError(error: unknown): PublicError {
+  if (error instanceof ClientUpgradeRequiredError) {
+    return apiError(error.code, "当前版本已停止服务，请安装最新版本", error.status, {
+      minimumBuild: error.minimumBuild,
+      currentBuild: error.currentBuild,
+      latestVersion: error.latestVersion,
+      downloadUrl: error.downloadUrl
+    });
+  }
   if (isPublicError(error)) return error;
   const message = error instanceof Error ? error.message : "";
   if (message === "Username already exists") return apiError("AUTH_USERNAME_TAKEN", "用户名已存在", 409);
@@ -353,8 +388,16 @@ function toPublicError(error: unknown): PublicError {
   if (message === "Voice is not available") return apiError("VOICE_UNAVAILABLE", "语音功能开发中", 409);
   if (message === "State version is stale") return apiError("STATE_VERSION_STALE", "牌桌状态已更新，请重试", 409);
   if (message === "Room is busy") return apiError("ROOM_BUSY", "牌桌正在处理上一项操作，请稍后重试", 409);
+  if (message === "Action id is required") return apiError("ACTION_ID_REQUIRED", "操作编号缺失，请同步牌桌后重试", 400);
+  if (message === "Action id is invalid") return apiError("ACTION_ID_INVALID", "操作编号无效，请同步牌桌后重试", 400);
+  if (message === "Action id was already used with different parameters") return apiError("ACTION_ID_CONFLICT", "该操作编号已用于其他操作，请同步牌桌后重试", 409);
+  if (message === "Raise is not reopened") return apiError("ACTION_NOT_ALLOWED", "短码全下未重新开放加注，请选择跟注或弃牌", 409);
   if (knownClientError(message)) return apiError("BAD_REQUEST", message, 400);
   return apiError("INTERNAL_ERROR", "服务暂不可用，请稍后重试", 500);
+}
+
+function errorPayload(error: PublicError, requestId: string): { ok: false; code: string; message: string; error: string; requestId: string; [key: string]: unknown } {
+  return { ok: false, code: error.code, message: error.message, error: error.message, requestId, ...(error.details ?? {}) };
 }
 
 function isPublicError(error: unknown): error is PublicError {
@@ -406,23 +449,21 @@ function knownClientError(message: string): boolean {
   ].includes(message) || message.startsWith("Seat must be ") || message.startsWith("Buy-in must be ") || message.startsWith("Bet cannot exceed ") || message.startsWith("Fixed-limit bet must be ");
 }
 
+function clientVersionMeta(): { latestVersion: string; downloadUrl: string | null } {
+  return { latestVersion: latestClientVersion, downloadUrl: clientDownloadUrl };
+}
+
 function checkAuthLimit(req: IncomingMessage, username: unknown): void {
   const ip = req.socket.remoteAddress ?? "unknown";
   const userKey = typeof username === "string" ? username.trim().toLowerCase().slice(0, 32) : "unknown";
   if (!authLimiter.allow(`ip:${ip}`) || !authLimiter.allow(`user:${userKey}:${ip}`)) throw apiError("RATE_LIMITED", "请求过于频繁，请稍后再试", 429);
 }
 
-function withRoomLock<T>(userId: string, enabled: boolean | undefined, work: () => T): T {
+function withRoomLock<T>(userId: string, enabled: boolean | undefined, work: () => T | Promise<T>): T | Promise<T> {
   if (!enabled) return work();
   const roomId = rooms.currentRoom(userId)?.id;
   if (!roomId) return work();
-  if (roomLocks.has(roomId)) throw new Error("Room is busy");
-  roomLocks.add(roomId);
-  try {
-    return work();
-  } finally {
-    roomLocks.delete(roomId);
-  }
+  return roomLocks.run(roomId, work);
 }
 
 function chooseCorsOrigin(origin: string | undefined): string | null {

@@ -30,6 +30,8 @@ Thumbs.db
 # Generated outputs and heavy local artifacts
 outputs/
 output/
+debug-final-build.log
+release-build.log
 checkpoints/
 *.ckpt
 *.pth

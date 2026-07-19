@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { apiRequest, AuthExpiredError, InvalidResponseError, NetworkError, ServerError, TimeoutError, validateHttpBaseUrl, validateSocketUrl } from "../src/api/client";
+import { apiRequest, AuthExpiredError, InvalidResponseError, NetworkError, ServerError, TimeoutError, UpgradeRequiredError, validateDownloadUrl, validateHttpBaseUrl, validateSocketUrl } from "../src/api/client";
 import { clearStoredToken, isValidTokenShape, legacyTokenKey, readStoredToken, secureTokenKey } from "../src/auth/tokenCore";
 import { parseChipAmount, parseChipAmountInRange } from "../src/utils/amount";
 import { ErrorLimiter } from "../src/utils/errorLimiter";
@@ -92,9 +92,41 @@ test("api client sends client build header when provided", async () => {
   assert.equal(seen, "3");
 });
 
+test("api client preserves structured upgrade errors", async () => {
+  await assert.rejects(
+    () =>
+      apiRequest("https://git-okami.onrender.com", "/auth/me", {
+        fetchImpl: response(
+          426,
+          JSON.stringify({
+            ok: false,
+            code: "CLIENT_UPGRADE_REQUIRED",
+            message: "当前版本已停止服务，请安装最新版本",
+            minimumBuild: 3,
+            currentBuild: 2,
+            latestVersion: "1.0.2",
+            downloadUrl: "https://github.com/fengluo298-cmyk/git-okami/releases/latest",
+            requestId: "req_1"
+          })
+        )
+      }),
+    (error) =>
+      error instanceof UpgradeRequiredError &&
+      error.code === "CLIENT_UPGRADE_REQUIRED" &&
+      error.minimumBuild === 3 &&
+      error.currentBuild === 2 &&
+      error.latestVersion === "1.0.2" &&
+      error.downloadUrl === "https://github.com/fengluo298-cmyk/git-okami/releases/latest" &&
+      error.requestId === "req_1"
+  );
+});
+
 test("production urls are restricted to trusted https and wss origins", () => {
   assert.equal(validateHttpBaseUrl("https://git-okami.onrender.com/path", false), "https://git-okami.onrender.com");
   assert.equal(validateSocketUrl("wss://git-okami.onrender.com/socket.io", false), "wss://git-okami.onrender.com");
+  assert.equal(validateDownloadUrl("https://github.com/fengluo298-cmyk/git-okami/releases/latest"), "https://github.com/fengluo298-cmyk/git-okami/releases/latest");
+  assert.equal(validateDownloadUrl("http://github.com/fengluo298-cmyk/git-okami/releases/latest"), null);
+  assert.equal(validateDownloadUrl("https://localhost/git-okami.apk"), null);
   assert.throws(() => validateHttpBaseUrl("http://127.0.0.1:4000", false), /HTTPS/);
   assert.throws(() => validateSocketUrl("ws://evil.example.com", false), /WSS/);
 });

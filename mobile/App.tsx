@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Alert,
   FlatList,
+  Linking,
   Pressable,
   SafeAreaView,
   ScrollView,
@@ -12,7 +13,7 @@ import {
   View
 } from "react-native";
 import { io, type Socket } from "socket.io-client";
-import { apiRequest, AuthExpiredError, InvalidResponseError, NetworkError, ServerError, TimeoutError, validateHttpBaseUrl, validateSocketUrl } from "./src/api/client";
+import { apiRequest, AuthExpiredError, InvalidResponseError, NetworkError, ServerError, TimeoutError, UpgradeRequiredError, validateDownloadUrl, validateHttpBaseUrl, validateSocketUrl } from "./src/api/client";
 import { tokenStorage } from "./src/auth/tokenStorage";
 import { CardView, type Card } from "./src/components/CardView";
 import { ProgressBar } from "./src/components/ProgressBar";
@@ -77,17 +78,28 @@ type RoomState = {
   };
 };
 type ConnectionStatus = "idle" | "connecting" | "online" | "reconnecting" | "offline";
-type AuthState = "unauthenticated" | "authenticating" | "restoring" | "authenticated" | "offline-authenticated" | "logging-out" | "error";
+type AuthState = "unauthenticated" | "authenticating" | "restoring" | "authenticated" | "offline-authenticated" | "logging-out" | "upgrade-required" | "error";
+type UpgradeInfo = {
+  message: string;
+  minimumBuild: number | null;
+  currentBuild: number | null;
+  latestVersion: string | null;
+  downloadUrl: string | null;
+  requestId: string | null;
+};
 
 const clientBuild = 3;
-const defaultSocketUrl = process.env.EXPO_PUBLIC_SOCKET_URL || process.env.EXPO_PUBLIC_SERVER_URL || "http://10.0.2.2:4000";
-const defaultApiBase = process.env.EXPO_PUBLIC_API_BASE_URL || process.env.EXPO_PUBLIC_SERVER_URL || "http://10.0.2.2:4000";
+const productionServerUrl = "https://git-okami.onrender.com";
+const devServerUrl = `http://${["10", "0", "2", "2"].join(".")}:4000`;
+const defaultSocketUrl = process.env.EXPO_PUBLIC_SOCKET_URL || process.env.EXPO_PUBLIC_SERVER_URL || (typeof __DEV__ !== "undefined" && __DEV__ ? devServerUrl : productionServerUrl);
+const defaultApiBase = process.env.EXPO_PUBLIC_API_BASE_URL || process.env.EXPO_PUBLIC_SERVER_URL || (typeof __DEV__ !== "undefined" && __DEV__ ? devServerUrl : productionServerUrl);
 const authTimeoutMs = 45_000;
 const errorLimiter = new ErrorLimiter();
 
 export default function App() {
   const mountedRef = useRef(true);
   const socketRef = useRef<Socket | null>(null);
+  const pendingActionIds = useRef<Record<string, string>>({});
   const [apiBase, setApiBase] = useState(defaultApiBase);
   const [socketUrl, setSocketUrl] = useState(defaultSocketUrl);
   const [token, setToken] = useState("");
@@ -101,6 +113,7 @@ export default function App() {
   const [socket, setSocket] = useState<Socket | null>(null);
   const [status, setStatus] = useState<ConnectionStatus>("idle");
   const [lastError, setLastError] = useState("");
+  const [upgradeInfo, setUpgradeInfo] = useState<UpgradeInfo | null>(null);
   const [user, setUser] = useState<User | null>(null);
   const [rooms, setRooms] = useState<RoomSummary[]>([]);
   const [room, setRoom] = useState<RoomState | null>(null);
@@ -143,7 +156,6 @@ export default function App() {
 
   useEffect(() => {
     setRaiseTo("");
-    setPendingOps((prev) => ({ ...prev, "game:action": false }));
   }, [room?.game?.street, room?.game?.availableActions?.minRaiseTo, room?.game?.availableActions?.maxRaiseTo]);
 
   async function restoreSession(savedToken: string) {
@@ -158,6 +170,7 @@ export default function App() {
         setAuthState("unauthenticated");
         return;
       }
+      if (setUpgradeFromError(error)) return;
       setToken(savedToken);
       setAuthState("offline-authenticated");
       setLastError(zhMessage(errorMessage(error)));
@@ -169,11 +182,13 @@ export default function App() {
     setBusy(true);
     setAuthState("authenticating");
     setLastError("");
+    setUpgradeInfo(null);
     try {
       const path = authMode === "login" ? "/auth/login" : "/auth/register";
       const result = await apiRequest<{ token: unknown; user: unknown }>(apiBase, path, { body: { username, password, nickname, avatar }, timeoutMs: authTimeoutMs, clientBuild });
       await acceptAuth(readToken(result.token), readUser(result.user));
     } catch (error) {
+      if (setUpgradeFromError(error)) return;
       setAuthState("error");
       showError(error);
     } finally {
@@ -186,10 +201,12 @@ export default function App() {
     setBusy(true);
     setAuthState("authenticating");
     setLastError("");
+    setUpgradeInfo(null);
     try {
       const result = await apiRequest<{ token: unknown; user: unknown }>(apiBase, "/auth/guest", { body: {}, timeoutMs: authTimeoutMs, clientBuild });
       await acceptAuth(readToken(result.token), readUser(result.user));
     } catch (error) {
+      if (setUpgradeFromError(error)) return;
       setAuthState("error");
       showError(error);
     } finally {
@@ -201,6 +218,7 @@ export default function App() {
     const safeSocketUrl = validateSocketUrl(socketUrl);
     validateHttpBaseUrl(apiBase);
     await tokenStorage.set(nextToken);
+    setUpgradeInfo(null);
     setToken(nextToken);
     setUser(nextUser);
     connectSocket(nextToken, safeSocketUrl);
@@ -221,6 +239,8 @@ export default function App() {
       setUser(null);
       setRoom(null);
       setRooms([]);
+      setUpgradeInfo(null);
+      pendingActionIds.current = {};
       setPendingOps({});
       setRaiseTo("");
       setStatus("idle");
@@ -256,11 +276,75 @@ export default function App() {
     });
     next.io.on("reconnect_attempt", () => setStatus("reconnecting"));
     next.on("connect_error", (error) => {
+      if (setUpgradeFromSocketError(error)) return;
       setStatus("offline");
       setLastError(zhMessage(error.message));
     });
     socketRef.current = next;
     setSocket(next);
+  }
+
+  async function refreshUpgradeStatus() {
+    setBusy(true);
+    try {
+      const result = await apiRequest<{ minimumBuild?: unknown; latestVersion?: unknown; downloadUrl?: unknown }>(apiBase, "/client-version", { timeoutMs: authTimeoutMs, clientBuild });
+      const minimumBuild = typeof result.minimumBuild === "number" ? result.minimumBuild : null;
+      if (minimumBuild !== null && clientBuild >= minimumBuild) {
+        setUpgradeInfo(null);
+        setAuthState("unauthenticated");
+        setLastError("");
+        return;
+      }
+      setUpgradeInfo({
+        message: "当前版本已停止服务，请安装最新版本",
+        minimumBuild,
+        currentBuild: clientBuild,
+        latestVersion: typeof result.latestVersion === "string" ? result.latestVersion : null,
+        downloadUrl: validateDownloadUrl(result.downloadUrl),
+        requestId: null
+      });
+    } catch (error) {
+      showError(error);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function setUpgradeFromError(error: unknown): boolean {
+    if (!(error instanceof UpgradeRequiredError)) return false;
+    cleanupSocket(socketRef.current);
+    socketRef.current = null;
+    setSocket(null);
+    setUser(null);
+    setRoom(null);
+    setRooms([]);
+    setToken("");
+    setUpgradeInfo({
+      message: error.message,
+      minimumBuild: error.minimumBuild,
+      currentBuild: error.currentBuild ?? clientBuild,
+      latestVersion: error.latestVersion,
+      downloadUrl: error.downloadUrl,
+      requestId: error.requestId
+    });
+    setAuthState("upgrade-required");
+    setLastError("");
+    return true;
+  }
+
+  function setUpgradeFromSocketError(error: Error & { data?: Record<string, unknown> }): boolean {
+    const data = error.data;
+    if (data?.code !== "CLIENT_UPGRADE_REQUIRED") return false;
+    return setUpgradeFromError(
+      new UpgradeRequiredError(
+        typeof data.message === "string" ? data.message : "当前版本已停止服务，请安装最新版本",
+        typeof data.minimumBuild === "number" ? data.minimumBuild : null,
+        typeof data.currentBuild === "number" ? data.currentBuild : clientBuild,
+        typeof data.latestVersion === "string" ? data.latestVersion : null,
+        typeof data.downloadUrl === "string" ? data.downloadUrl : null,
+        typeof data.requestId === "string" ? data.requestId : null
+      )
+    );
   }
 
   function emit(event: string, payload: Record<string, unknown> = {}, onOk?: (result: Record<string, unknown>) => void, key = event) {
@@ -271,9 +355,10 @@ export default function App() {
       return;
     }
     setPendingOps((prev) => ({ ...prev, [key]: true }));
-    const operationId = `${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}`;
+    const actionId = pendingActionIds.current[key] ?? `${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}`;
+    pendingActionIds.current[key] = actionId;
     const stateVersion = room?.stateVersion;
-    socket.timeout(6000).emit(event, { ...payload, ...(typeof stateVersion === "number" ? { stateVersion } : {}), operationId }, (error: Error | null, result?: { ok: boolean; error?: string; message?: string; [key: string]: unknown }) => {
+    socket.timeout(6000).emit(event, { ...payload, ...(typeof stateVersion === "number" ? { stateVersion } : {}), actionId }, (error: Error | null, result?: { ok: boolean; error?: string; message?: string; [key: string]: unknown }) => {
       if (!mountedRef.current) return;
       setPendingOps((prev) => ({ ...prev, [key]: false }));
       if (error) {
@@ -281,6 +366,7 @@ export default function App() {
         socket.emit("rooms:resume");
         return;
       }
+      delete pendingActionIds.current[key];
       if (!result?.ok) return showError(result?.message ?? result?.error ?? "操作失败");
       onOk?.(result);
     });
@@ -310,6 +396,32 @@ export default function App() {
     } catch (error) {
       showError(error);
     }
+  }
+
+  if (authState === "upgrade-required" && upgradeInfo) {
+    return (
+      <SafeAreaView style={styles.screen}>
+        <StatusBar barStyle="light-content" />
+        <View style={styles.upgradePanel}>
+          <Text style={styles.title}>需要更新</Text>
+          <Text style={styles.noticeText}>{upgradeInfo.message}</Text>
+          <Text style={styles.subtle}>
+            当前 build {upgradeInfo.currentBuild ?? clientBuild} / 最低 build {upgradeInfo.minimumBuild ?? "-"} / 最新版本 {upgradeInfo.latestVersion ?? "未知"}
+          </Text>
+          {upgradeInfo.downloadUrl ? (
+            <Pressable style={styles.primaryButton} disabled={busy} onPress={() => Linking.openURL(upgradeInfo.downloadUrl ?? "")}>
+              <Text style={styles.primaryText}>下载最新 APK</Text>
+            </Pressable>
+          ) : (
+            <Text style={styles.footerError}>暂未配置下载地址，请联系发布者获取最新 APK。</Text>
+          )}
+          <Pressable style={[styles.ghostButton, busy && styles.disabledButton]} disabled={busy} onPress={refreshUpgradeStatus}>
+            <Text style={styles.ghostText}>重新检查</Text>
+          </Pressable>
+          {upgradeInfo.requestId ? <Text style={styles.subtle}>请求编号 {upgradeInfo.requestId}</Text> : null}
+        </View>
+      </SafeAreaView>
+    );
   }
 
   if (!user) {
@@ -534,6 +646,7 @@ function errorMessage(error: unknown): string {
   if (error instanceof NetworkError) return "网络连接失败，已保留登录状态";
   if (error instanceof TimeoutError) return "请求超时，请稍后重试";
   if (error instanceof ServerError) return "服务暂不可用，请稍后重试";
+  if (error instanceof UpgradeRequiredError) return error.message;
   if (error instanceof InvalidResponseError) return error.message;
   return "操作失败，请稍后重试";
 }
@@ -732,6 +845,7 @@ const seatPositions = [
 const styles = StyleSheet.create({
   screen: { flex: 1, backgroundColor: "#0f1211" },
   connectPanel: { flexGrow: 1, padding: 24, justifyContent: "center" },
+  upgradePanel: { flex: 1, padding: 24, justifyContent: "center", gap: 14 },
   title: { color: "#f4ead5", fontSize: 36, fontWeight: "900", marginBottom: 6 },
   caption: { color: "#d6a844", fontSize: 13, fontWeight: "800", marginBottom: 28, textTransform: "uppercase" },
   header: { paddingHorizontal: 18, paddingVertical: 12, borderBottomWidth: 1, borderBottomColor: "#29322f", backgroundColor: "#151918", flexDirection: "row", alignItems: "center", justifyContent: "space-between" },

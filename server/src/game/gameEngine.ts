@@ -180,8 +180,10 @@ export class GameEngine {
       this.betTo(player, amount);
     } else if (type === "raise") {
       if (this.state.currentBet === 0) throw new Error("Use bet to open action");
+      if (player.acted && toCall > 0) throw new Error("Raise is not reopened");
       this.betTo(player, amount);
     } else if (type === "all-in") {
+      if (player.acted && toCall > 0 && player.chips > toCall) throw new Error("Raise is not reopened");
       this.betTo(player, player.bet + player.chips, true);
     } else {
       throw new Error("Invalid action");
@@ -405,8 +407,8 @@ export class GameEngine {
       canCheck: toCall === 0,
       canCall: toCall > 0,
       canBet: this.state.currentBet === 0 && player.chips > 0,
-      canRaise: this.state.currentBet > 0 && maxRaiseTo > this.state.currentBet,
-      canAllIn: player.chips > 0
+      canRaise: this.state.currentBet > 0 && maxRaiseTo > this.state.currentBet && !(player.acted && toCall > 0),
+      canAllIn: player.chips > 0 && !(player.acted && toCall > 0 && player.chips > toCall)
     };
   }
 

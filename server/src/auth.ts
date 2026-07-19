@@ -7,6 +7,7 @@ const JWT_SECRET = readJwtSecret();
 const VOICE_SECRET = process.env.VOICE_APP_SECRET || JWT_SECRET;
 const TOKEN_TTL_SECONDS = 60 * 60 * 24 * 30;
 const MAX_PASSWORD_LENGTH = 128;
+const DEFAULT_MIN_CLIENT_BUILD = 2;
 
 export type AuthSession = {
   token: string;
@@ -43,6 +44,7 @@ export function guestLogin(db: AppDatabase, input: { nickname?: string }): AuthS
 
 export function verifyToken(db: AppDatabase, token?: string): UserRecord {
   const payload = verifyJwt(token);
+  if (payload.scope !== "access") throw new Error("Invalid token");
   const user = db.getUser(String(payload.sub ?? ""));
   if (!user) throw new Error("Invalid token");
   return user;
@@ -56,8 +58,44 @@ export function isPasswordHash(value: string): boolean {
   return value.startsWith("$2");
 }
 
-export function requireClientBuild(value: unknown, minBuild: number): void {
-  if (Number(value ?? 0) < minBuild) throw new Error("Client version is no longer supported");
+export class ClientUpgradeRequiredError extends Error {
+  readonly code = "CLIENT_UPGRADE_REQUIRED";
+  readonly status = 426;
+
+  constructor(
+    readonly currentBuild: number | null,
+    readonly minimumBuild: number,
+    readonly latestVersion: string,
+    readonly downloadUrl: string | null
+  ) {
+    super("Client version is no longer supported");
+  }
+}
+
+export function readMinimumClientBuild(value: unknown = process.env.MIN_CLIENT_BUILD ?? (process.env.NODE_ENV === "production" ? undefined : DEFAULT_MIN_CLIENT_BUILD)): number {
+  const build = parseClientBuild(value);
+  if (build === null) throw new Error("MIN_CLIENT_BUILD must be a safe non-negative integer");
+  return build;
+}
+
+export function parseClientBuild(value: unknown): number | null {
+  if (typeof value === "number") return Number.isSafeInteger(value) && value >= 0 ? value : null;
+  if (typeof value !== "string") return null;
+  const text = value.trim();
+  if (!/^(0|[1-9]\d*)$/.test(text)) return null;
+  const build = Number(text);
+  return Number.isSafeInteger(build) ? build : null;
+}
+
+export function requireClientBuild(
+  value: unknown,
+  minBuild: number,
+  options: { latestVersion?: string; downloadUrl?: string | null } = {}
+): void {
+  const currentBuild = parseClientBuild(value);
+  if (currentBuild === null || currentBuild < minBuild) {
+    throw new ClientUpgradeRequiredError(currentBuild, minBuild, options.latestVersion ?? "1.0.2", options.downloadUrl ?? null);
+  }
 }
 
 function signToken(userId: string): string {
