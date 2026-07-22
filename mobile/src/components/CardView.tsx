@@ -1,32 +1,13 @@
 import { StyleSheet, Text, View } from "react-native";
+import { displayCardRank, type Card } from "../utils/cards";
 
-export type Card = {
-  rank: number;
-  suit: "S" | "H" | "D" | "C";
-};
-
-const rankLabels: Record<number, string> = {
-  2: "2",
-  3: "3",
-  4: "4",
-  5: "5",
-  6: "6",
-  7: "7",
-  8: "8",
-  9: "9",
-  10: "T",
-  11: "J",
-  12: "Q",
-  13: "K",
-  14: "A"
-};
 const suitLabels = { S: "♠", H: "♥", D: "♦", C: "♣" } as const;
 
 export function CardView({ card, hidden = false, small = false }: { card?: Card; hidden?: boolean; small?: boolean }) {
   const red = card?.suit === "H" || card?.suit === "D";
   return (
     <View style={[styles.card, hidden && styles.hidden, small && styles.smallCard]}>
-      <Text style={[styles.rank, red && styles.red, small && styles.smallText]}>{hidden || !card ? "?" : rankLabels[card.rank]}</Text>
+      <Text style={[styles.rank, red && styles.red, small && styles.smallText]}>{displayCardRank(card, hidden)}</Text>
       <Text style={[styles.suit, red && styles.red, small && styles.smallText]}>{hidden || !card ? "" : suitLabels[card.suit]}</Text>
     </View>
   );
