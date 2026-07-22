@@ -37,6 +37,11 @@ export type PotAward = {
   potIndex: number;
 };
 
+export type PublicSidePot = {
+  amount: number;
+  eligiblePlayerIds: string[];
+};
+
 export type GameState = {
   handId: number;
   street: Street;
@@ -63,6 +68,7 @@ export type PublicPlayer = Omit<EnginePlayer, "hand"> & {
 
 export type PublicGameState = Omit<GameState, "deck" | "players"> & {
   pot: number;
+  sidePots: PublicSidePot[];
   players: PublicPlayer[];
   availableActions: null | {
     toCall: number;
@@ -200,20 +206,35 @@ export class GameEngine {
     return this.executeAction(player.id, toCall === 0 ? "check" : "fold");
   }
 
-  updateConnection(playerId: string, connected: boolean): void {
+  updateConnection(playerId: string, connected: boolean): boolean {
     const player = this.state.players.find((candidate) => candidate.id === playerId);
-    if (player) player.connected = connected;
+    if (!player || player.connected === connected) return false;
+    player.connected = connected;
+    return true;
   }
 
   getPublicState(viewerId: string): PublicGameState {
     const viewer = this.state.players.find((player) => player.id === viewerId);
     const availableActions = viewer && viewer.seat === this.state.currentTurnSeat ? this.availableActions(viewer) : null;
     return {
-      ...this.state,
+      handId: this.state.handId,
+      street: this.state.street,
+      board: this.state.board.map(copyCard),
+      dealerSeat: this.state.dealerSeat,
+      smallBlindSeat: this.state.smallBlindSeat,
+      bigBlindSeat: this.state.bigBlindSeat,
+      currentTurnSeat: this.state.currentTurnSeat,
+      currentBet: this.state.currentBet,
+      minRaise: this.state.minRaise,
+      smallBlind: this.state.smallBlind,
+      bigBlind: this.state.bigBlind,
+      showdown: this.state.showdown,
+      winners: this.state.winners.map((winner) => ({ ...winner })),
       pot: potTotal(this.state.players),
+      sidePots: publicSidePots(this.state.players),
       players: this.state.players.map((player) => ({
         ...withoutHand(player),
-        hand: player.id === viewerId || (this.state.showdown && !player.folded) ? player.hand : undefined,
+        hand: player.id === viewerId || (this.state.showdown && !player.folded) ? player.hand.map(copyCard) : undefined,
         cardCount: player.hand.length,
         isTurn: player.seat === this.state.currentTurnSeat
       })),
@@ -433,6 +454,17 @@ export function potTotal(players: Pick<EnginePlayer, "totalBet">[]): number {
   return players.reduce((sum, player) => sum + player.totalBet, 0);
 }
 
+export function publicSidePots(players: Pick<EnginePlayer, "id" | "totalBet" | "folded">[]): PublicSidePot[] {
+  const levels = [...new Set(players.map((player) => player.totalBet).filter((bet) => bet > 0))].sort((a, b) => a - b);
+  let previous = 0;
+  return levels.flatMap((level) => {
+    const contributors = players.filter((player) => player.totalBet >= level);
+    const amount = (level - previous) * contributors.length;
+    previous = level;
+    return amount > 0 ? [{ amount, eligiblePlayerIds: contributors.filter((player) => !player.folded).map((player) => player.id) }] : [];
+  });
+}
+
 export function settlePots(players: EnginePlayer[], board: Card[], dealerSeat = 0): { awards: PotAward[] } {
   const levels = [...new Set(players.map((player) => player.totalBet).filter((bet) => bet > 0))].sort((a, b) => a - b);
   const totals = new Map<string, number>();
@@ -471,6 +503,10 @@ export function settlePots(players: EnginePlayer[], board: Card[], dealerSeat = 
 function withoutHand(player: EnginePlayer): Omit<EnginePlayer, "hand"> {
   const { hand: _hand, ...rest } = player;
   return rest;
+}
+
+function copyCard(card: Card): Card {
+  return { ...card };
 }
 
 function orderWinners(winners: EnginePlayer[], dealerSeat: number): EnginePlayer[] {

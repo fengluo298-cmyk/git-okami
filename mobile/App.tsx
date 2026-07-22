@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Alert,
+  AppState,
   FlatList,
   Linking,
   Pressable,
@@ -15,9 +16,11 @@ import {
 import { io, type Socket } from "socket.io-client";
 import { apiRequest, AuthExpiredError, InvalidResponseError, NetworkError, ServerError, TimeoutError, UpgradeRequiredError, validateDownloadUrl, validateHttpBaseUrl, validateSocketUrl } from "./src/api/client";
 import { tokenStorage } from "./src/auth/tokenStorage";
-import { CardView, type Card } from "./src/components/CardView";
+import { CardView } from "./src/components/CardView";
 import { ProgressBar } from "./src/components/ProgressBar";
+import { acceptAuthoritativeRoomState, type RoomStateSource } from "./src/roomState";
 import { ErrorLimiter } from "./src/utils/errorLimiter";
+import type { Card } from "./src/utils/cards";
 import { parseChipAmountInRange } from "./src/utils/amount";
 import { progressLabelFor } from "./src/utils/progress";
 
@@ -55,14 +58,18 @@ type RoomState = {
   name: string;
   ownerId: string;
   status: "lobby" | "playing" | "finished";
+  roomEpoch?: string;
+  handId?: number;
   stateVersion?: number;
   rules: Rules;
   seats: Array<Seat | null>;
   voice: VoiceUser[];
   game: null | {
+    handId?: number;
     street: string;
     board: Card[];
     pot: number;
+    sidePots?: Array<{ amount: number; eligiblePlayerIds: string[] }>;
     dealerSeat: number;
     smallBlindSeat: number;
     bigBlindSeat: number;
@@ -79,6 +86,7 @@ type RoomState = {
 };
 type ConnectionStatus = "idle" | "connecting" | "online" | "reconnecting" | "offline";
 type AuthState = "unauthenticated" | "authenticating" | "restoring" | "authenticated" | "offline-authenticated" | "logging-out" | "upgrade-required" | "error";
+type ResumeReason = "socket-connect" | "action-timeout" | "app-foreground" | "reconnect" | "manual-retry" | "state-conflict";
 type UpgradeInfo = {
   message: string;
   minimumBuild: number | null;
@@ -99,6 +107,12 @@ const errorLimiter = new ErrorLimiter();
 export default function App() {
   const mountedRef = useRef(true);
   const socketRef = useRef<Socket | null>(null);
+  const roomRef = useRef<RoomState | null>(null);
+  const pendingResumeRef = useRef(false);
+  const resumeInFlightRef = useRef(false);
+  const resumeTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastResumeAtRef = useRef(0);
+  const appStateRef = useRef(AppState.currentState);
   const pendingActionIds = useRef<Record<string, string>>({});
   const [apiBase, setApiBase] = useState(defaultApiBase);
   const [socketUrl, setSocketUrl] = useState(defaultSocketUrl);
@@ -144,8 +158,18 @@ export default function App() {
       });
     return () => {
       mountedRef.current = false;
+      clearResumeRequest();
       cleanupSocket(socketRef.current);
     };
+  }, []);
+
+  useEffect(() => {
+    const subscription = AppState.addEventListener("change", (nextState) => {
+      const wasBackground = appStateRef.current === "background" || appStateRef.current === "inactive";
+      appStateRef.current = nextState;
+      if (wasBackground && nextState === "active" && roomRef.current && socketRef.current?.connected && !resumeInFlightRef.current) requestRoomResume("app-foreground");
+    });
+    return () => subscription.remove();
   }, []);
 
   useEffect(() => {
@@ -157,6 +181,76 @@ export default function App() {
   useEffect(() => {
     setRaiseTo("");
   }, [room?.game?.street, room?.game?.availableActions?.minRaiseTo, room?.game?.availableActions?.maxRaiseTo]);
+
+  function replaceRoomState(nextRoom: RoomState | null): void {
+    roomRef.current = nextRoom;
+    setRoom(nextRoom);
+  }
+
+  function applyAuthoritativeRoomState(incoming: RoomState | null, source: RoomStateSource): boolean {
+    const decision = acceptAuthoritativeRoomState(roomRef.current, incoming, source, {
+      resumeInFlight: resumeInFlightRef.current || pendingResumeRef.current || source === "resume"
+    });
+    if (!decision.accepted) {
+      logRoomProtocol("reject", source, decision.reason, incoming);
+      if (decision.needsResume) requestRoomResume("state-conflict");
+      return false;
+    }
+    roomRef.current = decision.room;
+    if (!decision.duplicate) setRoom(decision.room);
+    clearResumeRequest();
+    return true;
+  }
+
+  function requestRoomResume(reason: ResumeReason): boolean {
+    const currentSocket = socketRef.current;
+    const currentRoom = roomRef.current;
+    if (!currentSocket?.connected) {
+      if (currentRoom) pendingResumeRef.current = true;
+      logResume("pending", reason, currentRoom);
+      return false;
+    }
+    if (resumeInFlightRef.current) {
+      pendingResumeRef.current = true;
+      logResume("in-flight", reason, currentRoom);
+      return false;
+    }
+    const now = Date.now();
+    const throttleMs = 1200;
+    if (now - lastResumeAtRef.current < throttleMs) {
+      pendingResumeRef.current = true;
+      schedulePendingResume(throttleMs - (now - lastResumeAtRef.current));
+      logResume("throttled", reason, currentRoom);
+      return false;
+    }
+    pendingResumeRef.current = false;
+    resumeInFlightRef.current = true;
+    lastResumeAtRef.current = now;
+    if (resumeTimeoutRef.current) clearTimeout(resumeTimeoutRef.current);
+    resumeTimeoutRef.current = setTimeout(() => {
+      resumeTimeoutRef.current = null;
+      resumeInFlightRef.current = false;
+      if (pendingResumeRef.current && mountedRef.current) requestRoomResume("manual-retry");
+    }, 8000);
+    currentSocket.emit("rooms:resume", { reason, roomId: currentRoom?.id, stateVersion: currentRoom?.stateVersion });
+    logResume("sent", reason, currentRoom);
+    return true;
+  }
+
+  function schedulePendingResume(delayMs: number): void {
+    if (resumeTimeoutRef.current) return;
+    resumeTimeoutRef.current = setTimeout(() => {
+      resumeTimeoutRef.current = null;
+      if (pendingResumeRef.current && mountedRef.current) requestRoomResume("manual-retry");
+    }, Math.max(0, delayMs));
+  }
+
+  function clearResumeRequest(): void {
+    pendingResumeRef.current = false;
+    resumeInFlightRef.current = false;
+    if (resumeTimeoutRef.current) clearTimeout(resumeTimeoutRef.current);
+    resumeTimeoutRef.current = null;
+  }
 
   async function restoreSession(savedToken: string) {
     setAuthState("restoring");
@@ -237,7 +331,7 @@ export default function App() {
     } finally {
       setToken("");
       setUser(null);
-      setRoom(null);
+      replaceRoomState(null);
       setRooms([]);
       setUpgradeInfo(null);
       pendingActionIds.current = {};
@@ -264,17 +358,18 @@ export default function App() {
       setStatus("online");
       setLastError("");
       setAuthState("authenticated");
-      next.emit("rooms:resume");
+      requestRoomResume("socket-connect");
     });
     next.on("session", setUser);
     next.on("rooms:list", setRooms);
-    next.on("room:state", (nextRoom: RoomState | null) => setRoom(nextRoom && nextRoom.status !== "playing" ? { ...nextRoom, game: null } : nextRoom));
+    next.on("room:state", (nextRoom: RoomState | null) => applyAuthoritativeRoomState(nextRoom, "room:state"));
     next.on("error:message", ({ message }: { message: string }) => showError(message));
     next.on("disconnect", (reason) => {
       setStatus(next.active ? "reconnecting" : "offline");
       setLastError(zhMessage(reason));
     });
     next.io.on("reconnect_attempt", () => setStatus("reconnecting"));
+    next.io.on("reconnect", () => requestRoomResume("reconnect"));
     next.on("connect_error", (error) => {
       if (setUpgradeFromSocketError(error)) return;
       setStatus("offline");
@@ -316,7 +411,7 @@ export default function App() {
     socketRef.current = null;
     setSocket(null);
     setUser(null);
-    setRoom(null);
+    replaceRoomState(null);
     setRooms([]);
     setToken("");
     setUpgradeInfo({
@@ -351,23 +446,24 @@ export default function App() {
     if (pendingOps[key]) return;
     if (!socket?.connected) {
       setLastError("正在等待连接");
-      socket?.emit("rooms:resume");
+      requestRoomResume("manual-retry");
       return;
     }
     setPendingOps((prev) => ({ ...prev, [key]: true }));
     const actionId = pendingActionIds.current[key] ?? `${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}`;
     pendingActionIds.current[key] = actionId;
-    const stateVersion = room?.stateVersion;
+    const stateVersion = roomRef.current?.stateVersion;
     socket.timeout(6000).emit(event, { ...payload, ...(typeof stateVersion === "number" ? { stateVersion } : {}), actionId }, (error: Error | null, result?: { ok: boolean; error?: string; message?: string; [key: string]: unknown }) => {
       if (!mountedRef.current) return;
       setPendingOps((prev) => ({ ...prev, [key]: false }));
       if (error) {
         setLastError("请求超时，正在同步房间状态");
-        socket.emit("rooms:resume");
+        requestRoomResume("action-timeout");
         return;
       }
       delete pendingActionIds.current[key];
       if (!result?.ok) return showError(result?.message ?? result?.error ?? "操作失败");
+      if (Object.prototype.hasOwnProperty.call(result, "state")) applyAuthoritativeRoomState(readAckRoomState(result.state), sourceForEvent(event));
       onOk?.(result);
     });
   }
@@ -531,14 +627,15 @@ export default function App() {
         <View style={styles.table}>
           <View style={styles.tableRail} />
           {room.seats.map((seat, index) => (
-            <SeatView key={index} seat={seat} index={index} userId={user.id} game={room.game} disabled={anyPending || room.status === "playing"} onSit={() => sitAt(index)} />
+            <SeatView key={`${room.id}:${index}:${seat?.id ?? "empty"}`} seat={seat} index={index} userId={user.id} game={room.game} disabled={anyPending || room.status === "playing"} onSit={() => sitAt(index)} />
           ))}
           <View style={styles.board}>
             <Text style={styles.street}>{streetLabel(room.game?.street ?? "lobby")}</Text>
             <View style={styles.cardsRow}>
-              {Array.from({ length: 5 }).map((_, index) => (
-                <CardView key={index} card={room.game?.board[index]} hidden={!room.game?.board[index]} small />
-              ))}
+              {Array.from({ length: 5 }).map((_, index) => {
+                const card = room.game?.board[index];
+                return <CardView key={`board:${index}:${card ? `${card.rank}${card.suit}` : "empty"}`} card={card} hidden={!card} small />;
+              })}
             </View>
             <View style={styles.potPill}>
               <Text style={styles.potLabel}>底池</Text>
@@ -552,7 +649,7 @@ export default function App() {
             <Text style={styles.panelTitle}>我的手牌</Text>
             <Text style={styles.subtle}>{playerStateLabel(gameSeat, mySeat)}</Text>
           </View>
-          <View style={styles.cardsRow}>{(gameSeat?.hand ?? []).map((card, index) => <CardView key={`${card.rank}${card.suit}${index}`} card={card} />)}</View>
+          <View style={styles.cardsRow}>{(gameSeat?.hand ?? []).map((card, index) => <CardView key={`hand:${index}:${card.rank}${card.suit}`} card={card} />)}</View>
         </View>
 
         {room.game?.winners?.length ? (
@@ -622,6 +719,34 @@ function cleanupSocket(socket: Socket | null): void {
   socket?.removeAllListeners();
   socket?.io.removeAllListeners();
   socket?.disconnect();
+}
+
+function readAckRoomState(value: unknown): RoomState | null {
+  return value === null || (value !== undefined && typeof value === "object") ? (value as RoomState | null) : null;
+}
+
+function sourceForEvent(event: string): RoomStateSource {
+  if (event === "rooms:create") return "create";
+  if (event === "rooms:join") return "join";
+  if (event === "rooms:leave") return "leave";
+  return "ack";
+}
+
+function logRoomProtocol(action: string, source: RoomStateSource, reason: string | undefined, room: RoomState | null): void {
+  console.warn(JSON.stringify({ level: "warn", event: "room-state", action, source, reason, ...safeRoomMeta(room) }));
+}
+
+function logResume(action: string, reason: ResumeReason, room: RoomState | null): void {
+  console.info(JSON.stringify({ level: "info", event: "rooms-resume", action, reason, ...safeRoomMeta(room) }));
+}
+
+function safeRoomMeta(room: RoomState | null): Record<string, unknown> {
+  return {
+    roomId: room?.id,
+    roomEpoch: room?.roomEpoch,
+    handId: room?.handId ?? room?.game?.handId,
+    stateVersion: room?.stateVersion
+  };
 }
 
 function readToken(value: unknown): string {
@@ -697,7 +822,12 @@ function SeatView({ seat, index, userId, game, disabled, onSit }: { seat: Seat |
               <Text style={styles.subtle}>{liveSeat.connected ? "在线" : "离线"}</Text>
             </View>
           </View>
-          <View style={styles.miniCards}>{Array.from({ length: liveSeat.cardCount ?? 0 }).map((_, cardIndex) => <CardView key={cardIndex} card={liveSeat.hand?.[cardIndex]} hidden={!liveSeat.hand?.[cardIndex] && liveSeat.id !== userId} small />)}</View>
+          <View style={styles.miniCards}>
+            {Array.from({ length: liveSeat.cardCount ?? 0 }).map((_, cardIndex) => {
+              const card = liveSeat.hand?.[cardIndex];
+              return <CardView key={`seat:${liveSeat.seat}:${cardIndex}:${card ? `${card.rank}${card.suit}` : "hidden"}`} card={card} hidden={!card && liveSeat.id !== userId} small />;
+            })}
+          </View>
           <Text style={styles.stack}>{liveSeat.chips} 筹码</Text>
           <Text style={styles.badge}>{seatBadge(liveSeat, role)}</Text>
         </>

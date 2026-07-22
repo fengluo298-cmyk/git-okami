@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join, resolve, sep } from "node:path";
 import { createServer } from "node:net";
 import { io as connectSocket, type Socket as ClientSocket } from "socket.io-client";
+import { acceptAuthoritativeRoomState, type AuthoritativeRoomState } from "../../mobile/src/roomState.js";
 
 type Json = Record<string, any>;
 
@@ -121,8 +122,192 @@ test("upgrade and health endpoints expose version state without requiring a clie
   }
 });
 
-async function startHeadsUpRoom(alpha: ClientSocket, beta: ClientSocket): Promise<Json> {
-  const created = await emitAck(alpha, "rooms:create", { actionId: unique("create") });
+test("same user reconnect keeps the new socket online when the old socket disconnects", async () => {
+  const server = await startServer();
+  const sockets: ClientSocket[] = [];
+  try {
+    const alpha = await register(server.port, "alpha_reconnect");
+    const beta = await register(server.port, "beta_reconnect");
+    const alphaOld = await connectPlayer(server.port, alpha.token);
+    const betaSocket = await connectPlayer(server.port, beta.token);
+    sockets.push(alphaOld, betaSocket);
+    let betaState: Json | null = null;
+    betaSocket.on("room:state", (state) => {
+      if (state) betaState = state;
+    });
+
+    const created = await emitAck(alphaOld, "rooms:create", { actionId: unique("create") });
+    assert.equal(created.ok, true);
+    assert.equal((await emitAck(betaSocket, "rooms:join", { actionId: unique("join"), roomId: created.roomId })).ok, true);
+    assert.equal((await emitAck(alphaOld, "seat:sit", { actionId: unique("sit_a"), seat: 0, buyIn: 1000 })).ok, true);
+    await waitFor(() => betaState !== null && seat(betaState, alpha.user.id)?.connected === true);
+
+    const alphaNew = await connectPlayer(server.port, alpha.token);
+    sockets.push(alphaNew);
+    await waitFor(() => betaState !== null && seat(betaState, alpha.user.id)?.connected === true);
+    alphaOld.disconnect();
+    await delay(80);
+    assert.equal(seat(betaState, alpha.user.id)?.connected, true);
+
+    alphaNew.disconnect();
+    await waitFor(() => betaState !== null && seat(betaState, alpha.user.id)?.connected === false);
+  } finally {
+    for (const socket of sockets) socket.disconnect();
+    await server.close();
+  }
+});
+
+test("game action ack and broadcast share the same authoritative snapshot", async () => {
+  const server = await startServer();
+  const sockets: ClientSocket[] = [];
+  try {
+    const alpha = await register(server.port, "alpha_ack_broadcast");
+    const beta = await register(server.port, "beta_ack_broadcast");
+    const alphaSocket = await connectPlayer(server.port, alpha.token);
+    const betaSocket = await connectPlayer(server.port, beta.token);
+    sockets.push(alphaSocket, betaSocket);
+    const alphaStates: Json[] = [];
+    const betaStates: Json[] = [];
+    alphaSocket.on("room:state", (state) => {
+      if (state) alphaStates.push(state);
+    });
+    betaSocket.on("room:state", (state) => {
+      if (state) betaStates.push(state);
+    });
+
+    const started = await startHeadsUpRoom(alphaSocket, betaSocket);
+    await delay(50);
+    alphaStates.length = 0;
+
+    const actionId = unique("ack_broadcast");
+    const ack = await emitAck(alphaSocket, "game:action", { actionId, type: "call", stateVersion: started.stateVersion });
+    assert.equal(ack.ok, true);
+    const broadcast = await waitForState(alphaStates, ack.stateVersion);
+    assert.deepEqual(ack.state, broadcast);
+    const betaBroadcast = await waitForState(betaStates, ack.stateVersion);
+    assertPublicFieldsMatch(ack.state, betaBroadcast);
+
+    const broadcastCount = alphaStates.filter((state) => state.stateVersion === ack.stateVersion).length;
+    assert.equal(broadcastCount, 1);
+    assert.equal(betaStates.filter((state) => state.stateVersion === ack.stateVersion).length, 1);
+    assertDuplicate(acceptAuthoritativeRoomState(asRoomState(ack.state), asRoomState(broadcast), "room:state"));
+    assertDuplicate(acceptAuthoritativeRoomState(asRoomState(broadcast), asRoomState(ack.state), "ack"));
+    const ackLost = acceptAuthoritativeRoomState(asRoomState(started), asRoomState(broadcast), "room:state");
+    assert.equal(ackLost.accepted, true);
+    assertDuplicate(acceptAuthoritativeRoomState(ackLost.room!, asRoomState(broadcast), "room:state"));
+
+    const retry = await emitAck(alphaSocket, "game:action", { actionId, type: "call", stateVersion: started.stateVersion });
+    await delay(50);
+    assert.deepEqual(retry, ack);
+    assert.equal(alphaStates.filter((state) => state.stateVersion === ack.stateVersion).length, broadcastCount);
+  } finally {
+    for (const socket of sockets) socket.disconnect();
+    await server.close();
+  }
+});
+
+test("non-current player reconnect does not orphan or duplicate the action timer", async () => {
+  const server = await startServer();
+  const sockets: ClientSocket[] = [];
+  try {
+    const alpha = await register(server.port, "alpha_timer_reconnect");
+    const beta = await register(server.port, "beta_timer_reconnect");
+    const alphaSocket = await connectPlayer(server.port, alpha.token);
+    let betaSocket = await connectPlayer(server.port, beta.token);
+    sockets.push(alphaSocket, betaSocket);
+    let latestAlpha: Json | null = null;
+    alphaSocket.on("room:state", (state) => {
+      if (state) latestAlpha = state;
+    });
+
+    const started = await startHeadsUpRoom(alphaSocket, betaSocket, { actionTimeoutSeconds: 1 });
+    latestAlpha = started;
+    assert.equal(started.game.currentTurnSeat, seat(started, alpha.user.id)?.seat);
+
+    betaSocket.disconnect();
+    await waitFor(() => latestAlpha !== null && seat(latestAlpha, beta.user.id)?.connected === false);
+    betaSocket = await connectPlayer(server.port, beta.token);
+    sockets.push(betaSocket);
+    await waitFor(() => latestAlpha !== null && seat(latestAlpha, beta.user.id)?.connected === true);
+
+    const versionAfterReconnect = latestAlpha!.stateVersion;
+    await waitFor(() => latestAlpha !== null && latestAlpha.stateVersion > versionAfterReconnect, 2500);
+    const versionAfterTimeout = latestAlpha!.stateVersion;
+    assert.equal(latestAlpha!.status, "lobby");
+    assert.equal(latestAlpha!.game, null);
+
+    await delay(300);
+    assert.equal(latestAlpha!.stateVersion, versionAfterTimeout);
+  } finally {
+    for (const socket of sockets) socket.disconnect();
+    await server.close();
+  }
+});
+
+test("two socket clients keep public state synchronized through a hand and reconnect", async () => {
+  const server = await startServer();
+  const sockets: ClientSocket[] = [];
+  try {
+    const alpha = await register(server.port, "alpha_sync");
+    const beta = await register(server.port, "beta_sync");
+    const alphaSocket = await connectPlayer(server.port, alpha.token);
+    let betaSocket = await connectPlayer(server.port, beta.token);
+    sockets.push(alphaSocket, betaSocket);
+    const latest: Record<string, Json | null> = { alpha: null, beta: null };
+    alphaSocket.on("room:state", (state) => {
+      if (state) latest.alpha = state;
+    });
+    betaSocket.on("room:state", (state) => {
+      if (state) latest.beta = state;
+    });
+
+    const started = await startHeadsUpRoom(alphaSocket, betaSocket);
+    latest.alpha = started;
+    await waitForSync(latest, started.stateVersion);
+    assertPublicFieldsMatch(latest.alpha!, latest.beta!);
+
+    await actCurrent(latest, alpha, beta, alphaSocket, betaSocket, "call");
+    await actCurrent(latest, alpha, beta, alphaSocket, betaSocket, "check");
+    await actCurrent(latest, alpha, beta, alphaSocket, betaSocket, "check");
+    await actCurrent(latest, alpha, beta, alphaSocket, betaSocket, "bet", 40);
+    await actCurrent(latest, alpha, beta, alphaSocket, betaSocket, "raise", 80);
+    await actCurrent(latest, alpha, beta, alphaSocket, betaSocket, "call");
+    await actCurrent(latest, alpha, beta, alphaSocket, betaSocket, "check");
+    await actCurrent(latest, alpha, beta, alphaSocket, betaSocket, "check");
+    await actCurrent(latest, alpha, beta, alphaSocket, betaSocket, "check");
+    await actCurrent(latest, alpha, beta, alphaSocket, betaSocket, "check");
+    assert.equal(latest.alpha!.status, "lobby");
+
+    await ready(latest, alphaSocket, betaSocket);
+    const nextHand = await emitAck(alphaSocket, "game:start", { actionId: unique("next"), stateVersion: latest.alpha!.stateVersion });
+    assert.equal(nextHand.ok, true);
+    latest.alpha = nextHand.state;
+    await waitForSync(latest, nextHand.stateVersion);
+    assert.equal(latest.alpha!.handId, 2);
+    await actCurrent(latest, alpha, beta, alphaSocket, betaSocket, "all-in");
+    await actCurrent(latest, alpha, beta, alphaSocket, betaSocket, "fold");
+
+    betaSocket.disconnect();
+    await waitFor(() => latest.alpha !== null && seat(latest.alpha, beta.user.id)?.connected === false);
+    const alphaReady = await emitAck(alphaSocket, "seat:ready", { actionId: unique("alpha_ready"), ready: true, stateVersion: latest.alpha!.stateVersion });
+    assert.equal(alphaReady.ok, true);
+    latest.alpha = alphaReady.state;
+
+    betaSocket = await connectPlayer(server.port, beta.token);
+    sockets.push(betaSocket);
+    betaSocket.on("room:state", (state) => {
+      if (state) latest.beta = state;
+    });
+    await waitFor(() => latest.beta !== null && latest.beta.stateVersion >= latest.alpha!.stateVersion && seat(latest.beta, beta.user.id)?.connected === true);
+    assertPublicFieldsMatch(latest.alpha!, latest.beta!);
+  } finally {
+    for (const socket of sockets) socket.disconnect();
+    await server.close();
+  }
+});
+
+async function startHeadsUpRoom(alpha: ClientSocket, beta: ClientSocket, rules: Json = {}): Promise<Json> {
+  const created = await emitAck(alpha, "rooms:create", { actionId: unique("create"), rules });
   assert.equal(created.ok, true);
   const roomId = created.roomId;
   assert.equal((await emitAck(beta, "rooms:join", { actionId: unique("join"), roomId })).ok, true);
@@ -245,6 +430,107 @@ function player(state: Json, userId: string): Json {
   const found = state.game.players.find((candidate: Json) => candidate.id === userId);
   assert.ok(found);
   return found;
+}
+
+function seat(state: Json | null, userId: string): Json | null {
+  return state?.seats.find((candidate: Json | null) => candidate?.id === userId) ?? null;
+}
+
+async function ready(latest: Record<string, Json | null>, alpha: ClientSocket, beta: ClientSocket): Promise<void> {
+  const first = await emitAck(alpha, "seat:ready", { actionId: unique("ready_alpha"), ready: true, stateVersion: latest.alpha!.stateVersion });
+  assert.equal(first.ok, true);
+  latest.alpha = first.state;
+  await waitForSync(latest, first.stateVersion);
+  const second = await emitAck(beta, "seat:ready", { actionId: unique("ready_beta"), ready: true, stateVersion: latest.beta!.stateVersion });
+  assert.equal(second.ok, true);
+  latest.beta = second.state;
+  await waitForSync(latest, second.stateVersion);
+}
+
+async function actCurrent(latest: Record<string, Json | null>, alpha: Json, beta: Json, alphaSocket: ClientSocket, betaSocket: ClientSocket, type: string, amount?: number): Promise<void> {
+  const state = latest.alpha!;
+  const actor = state.game.players.find((candidate: Json) => candidate.seat === state.game.currentTurnSeat);
+  assert.ok(actor);
+  const socket = actor.id === alpha.user.id ? alphaSocket : betaSocket;
+  const key = actor.id === alpha.user.id ? "alpha" : "beta";
+  const result = await emitAck(socket, "game:action", { actionId: unique(type.replace("-", "_")), type, ...(amount === undefined ? {} : { amount }), stateVersion: latest[key]!.stateVersion });
+  assert.equal(result.ok, true);
+  latest[key] = result.state;
+  await waitForSync(latest, result.stateVersion);
+  assertPublicFieldsMatch(latest.alpha!, latest.beta!);
+}
+
+async function waitForSync(latest: Record<string, Json | null>, stateVersion: number): Promise<void> {
+  await waitFor(() => Boolean(latest.alpha && latest.beta && latest.alpha.stateVersion >= stateVersion && latest.beta.stateVersion >= stateVersion));
+}
+
+async function waitFor(predicate: () => boolean, timeoutMs = 3000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await delay(20);
+  }
+  assert.equal(predicate(), true);
+}
+
+async function waitForState(states: Json[], stateVersion: number): Promise<Json> {
+  await waitFor(() => states.some((state) => state?.stateVersion === stateVersion));
+  const state = states.find((candidate) => candidate?.stateVersion === stateVersion);
+  assert.ok(state);
+  return state;
+}
+
+function assertDuplicate(decision: ReturnType<typeof acceptAuthoritativeRoomState>): void {
+  assert.equal(decision.accepted, true);
+  assert.equal(decision.duplicate, true);
+}
+
+function asRoomState(state: Json): AuthoritativeRoomState {
+  return state as AuthoritativeRoomState;
+}
+
+function assertPublicFieldsMatch(left: Json, right: Json): void {
+  assert.deepEqual(publicFields(left), publicFields(right));
+  const leftHands = left.game?.players.map((candidate: Json) => candidate.hand).filter(Boolean) ?? [];
+  const rightHands = right.game?.players.map((candidate: Json) => candidate.hand).filter(Boolean) ?? [];
+  assert.equal(leftHands.length <= 1, true);
+  assert.equal(rightHands.length <= 1, true);
+}
+
+function publicFields(state: Json): Json {
+  return {
+    roomId: state.id,
+    roomEpoch: state.roomEpoch,
+    handId: state.handId,
+    stateVersion: state.stateVersion,
+    status: state.status,
+    street: state.game?.street ?? null,
+    dealer: state.game?.dealerSeat ?? null,
+    currentPlayer: state.game?.currentTurnSeat ?? null,
+    board: state.game?.board ?? [],
+    pot: state.game?.pot ?? 0,
+    sidePots: state.game?.sidePots ?? [],
+    seats: state.seats.map((candidate: Json | null) =>
+      candidate
+        ? {
+            id: candidate.id,
+            seat: candidate.seat,
+            chips: candidate.chips,
+            ready: candidate.ready,
+            connected: candidate.connected
+          }
+        : null
+    ),
+    players: (state.game?.players ?? []).map((candidate: Json) => ({
+      id: candidate.id,
+      seat: candidate.seat,
+      chips: candidate.chips,
+      bet: candidate.bet,
+      folded: candidate.folded,
+      allIn: candidate.allIn,
+      connected: candidate.connected
+    }))
+  };
 }
 
 function delay(ms: number): Promise<void> {

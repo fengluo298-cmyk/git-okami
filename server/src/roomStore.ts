@@ -29,10 +29,13 @@ export type RoomSeat = {
 
 export type Room = {
   id: string;
+  roomEpoch: string;
   name: string;
   ownerId: string;
   status: RoomStatus;
   version: number;
+  handId: number;
+  timerGeneration: number;
   seats: Array<RoomSeat | null>;
   members: Set<string>;
   voice: Map<string, { muted: boolean; speaking: boolean }>;
@@ -44,14 +47,26 @@ export type Room = {
 
 export type PublicRoom = {
   id: string;
+  roomEpoch: string;
   name: string;
   ownerId: string;
   status: RoomStatus;
+  handId: number;
   stateVersion: number;
   rules: RoomRules;
   seats: Array<RoomSeat | null>;
   voice: Array<{ userId: string; nickname: string; muted: boolean; speaking: boolean }>;
   game: PublicGameState | null;
+};
+
+export type RoomTimerToken = {
+  roomId: string;
+  roomEpoch: string;
+  handId: number;
+  stateVersion: number;
+  currentTurnSeat: number | null;
+  timerGeneration: number;
+  deadline: number;
 };
 
 export class RoomStore {
@@ -75,10 +90,13 @@ export class RoomStore {
     const fullRules = normalizeRules(rules);
     const room: Room = {
       id: randomUUID().slice(0, 8),
+      roomEpoch: randomUUID(),
       name: (name ?? "").trim().slice(0, 24) || `${owner.nickname}的牌桌`,
       ownerId: owner.id,
       status: "lobby",
       version: 1,
+      handId: 0,
+      timerGeneration: 0,
       seats: Array.from({ length: fullRules.maxPlayers }, () => null),
       members: new Set([owner.id]),
       voice: new Map(),
@@ -169,9 +187,12 @@ export class RoomStore {
     const players = room.seats.filter((seat): seat is RoomSeat => Boolean(seat && seat.ready && seat.chips > 0));
     if (players.length < 2) throw new Error("Need at least two ready players");
     const dealerSeat = nextDealerSeat(players, room.lastDealerSeat);
+    const nextHandId = room.handId + 1;
     const engine = new GameEngine(room.rules);
     engine.startHand(players.map(toStartPlayer), { dealerSeat });
+    engine.state.handId = nextHandId;
     room.engine = engine;
+    room.handId = nextHandId;
     room.status = "playing";
     room.lastDealerSeat = dealerSeat;
     for (const seat of room.seats) {
@@ -210,9 +231,10 @@ export class RoomStore {
     const room = this.currentRoom(userId);
     if (!room) return null;
     const seat = room.seats.find((candidate) => candidate?.id === userId);
+    const seatChanged = Boolean(seat && seat.connected !== connected);
     if (seat) seat.connected = connected;
-    room.engine?.updateConnection(userId, connected);
-    return seat ? this.touch(room) : room;
+    const engineChanged = room.engine?.updateConnection(userId, connected) ?? false;
+    return seatChanged || engineChanged ? this.touch(room) : room;
   }
 
   currentRoom(userId: string): Room | null {
@@ -221,22 +243,40 @@ export class RoomStore {
   }
 
   publicRoom(roomId: string, viewerId: string): PublicRoom {
-    const room = this.mustRoom(roomId);
+    return createRoomSnapshot(this.mustRoom(roomId), viewerId);
+  }
+
+  createActionTimerToken(room: Room, deadline: number): RoomTimerToken | null {
+    room.timerGeneration += 1;
+    if (room.status !== "playing" || !room.engine || room.engine.state.currentTurnSeat === null) return null;
     return {
-      id: room.id,
-      name: room.name,
-      ownerId: room.ownerId,
-      status: room.status,
+      roomId: room.id,
+      roomEpoch: room.roomEpoch,
+      handId: room.handId,
       stateVersion: room.version,
-      rules: room.rules,
-      seats: room.seats,
-      voice: [...room.voice.entries()].map(([userId, state]) => ({
-        userId,
-        nickname: room.seats.find((seat) => seat?.id === userId)?.nickname ?? "Player",
-        ...state
-      })),
-      game: room.engine ? room.engine.getPublicState(viewerId) : null
+      currentTurnSeat: room.engine.state.currentTurnSeat,
+      timerGeneration: room.timerGeneration,
+      deadline
     };
+  }
+
+  autoActionIfCurrent(token: RoomTimerToken): Room | null {
+    if (!this.isActionTimerCurrent(token)) return null;
+    return this.autoAction(token.roomId);
+  }
+
+  isActionTimerCurrent(token: RoomTimerToken): boolean {
+    const room = this.rooms.get(token.roomId);
+    return Boolean(
+      room &&
+        room.roomEpoch === token.roomEpoch &&
+        room.handId === token.handId &&
+        room.version === token.stateVersion &&
+        room.timerGeneration === token.timerGeneration &&
+        room.engine &&
+        room.engine.state.currentTurnSeat === token.currentTurnSeat &&
+        room.status === "playing"
+    );
   }
 
   roomById(roomId: string): Room | null {
@@ -319,6 +359,26 @@ export class RoomStore {
     room.version += 1;
     return room;
   }
+}
+
+export function createRoomSnapshot(room: Room, viewerId: string): PublicRoom {
+  return {
+    id: room.id,
+    roomEpoch: room.roomEpoch,
+    name: room.name,
+    ownerId: room.ownerId,
+    status: room.status,
+    handId: room.handId,
+    stateVersion: room.version,
+    rules: { ...room.rules },
+    seats: room.seats.map((seat) => (seat ? { ...seat } : null)),
+    voice: [...room.voice.entries()].map(([userId, state]) => ({
+      userId,
+      nickname: room.seats.find((seat) => seat?.id === userId)?.nickname ?? "Player",
+      ...state
+    })),
+    game: room.engine ? room.engine.getPublicState(viewerId) : null
+  };
 }
 
 function toStartPlayer(seat: RoomSeat): StartPlayer {

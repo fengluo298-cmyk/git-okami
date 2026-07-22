@@ -7,6 +7,7 @@ import { RoomStore, type Room, type RoomRules } from "./roomStore.js";
 import type { PlayerAction } from "./game/gameEngine.js";
 import { parseChipAmount } from "./amount.js";
 import { OperationDeduper, RoomActionQueue, type AckResult } from "./operations.js";
+import { SocketPresence } from "./socketPresence.js";
 
 const port = Number(process.env.PORT ?? 4000);
 const corsOrigin = readCorsOrigin("CORS_ORIGIN");
@@ -19,6 +20,7 @@ const voiceEnabled = (process.env.VOICE_PROVIDER ?? "none") !== "none";
 const db = new AppDatabase();
 const rooms = new RoomStore(db);
 const actionTimers = new Map<string, NodeJS.Timeout>();
+const userSockets = new SocketPresence();
 const operations = new OperationDeduper();
 const authLimiter = rateLimiter(20, 15 * 60_000);
 const roomLocks = new RoomActionQueue();
@@ -95,12 +97,13 @@ io.use((socket, next) => {
 
 io.on("connection", (socket: Socket) => {
   const user = socket.data.user as UserRecord;
+  userSockets.add(user.id, socket.id);
   socket.emit("session", user);
   socket.emit("rooms:list", rooms.listRooms());
-  resumeRoom(socket, user);
+  void resumeRoom(socket, user).catch((error) => logSocketTaskError("rooms:resume", error));
 
   socket.on("rooms:list", () => socket.emit("rooms:list", rooms.listRooms()));
-  socket.on("rooms:resume", () => resumeRoom(socket, user));
+  socket.on("rooms:resume", () => void resumeRoom(socket, user).catch((error) => logSocketTaskError("rooms:resume", error)));
 
   socket.on("rooms:create", (payload: { name?: string; rules?: Partial<RoomRules>; operationId?: string } = {}, ack?: Ack) =>
     handle("rooms:create", socket, ack, payload, () => {
@@ -119,7 +122,7 @@ io.on("connection", (socket: Socket) => {
       emitRoom(room);
       emitRooms();
       return { roomId: room.id };
-    })
+    }, { lockRoomId: payload.roomId })
   );
 
   socket.on("rooms:leave", (payload: { operationId?: string; stateVersion?: number } = {}, ack?: Ack) =>
@@ -191,7 +194,7 @@ io.on("connection", (socket: Socket) => {
       const room = rooms.joinVoice(user.id);
       emitRoom(room);
       return { voiceToken: signVoiceToken(user.id, room.id), roomId: room.id };
-    })
+    }, { lockRoom: true })
   );
 
   socket.on("voice:leave", (payload: { operationId?: string } = {}, ack?: Ack) =>
@@ -200,7 +203,7 @@ io.on("connection", (socket: Socket) => {
       const room = rooms.leaveVoice(user.id);
       emitRoom(room);
       return {};
-    })
+    }, { lockRoom: true })
   );
 
   socket.on("voice:mute", (payload: { muted: boolean; operationId?: string }, ack?: Ack) =>
@@ -209,7 +212,7 @@ io.on("connection", (socket: Socket) => {
       const room = rooms.setVoiceMuted(user.id, Boolean(payload.muted));
       emitRoom(room);
       return {};
-    })
+    }, { lockRoom: true })
   );
 
   socket.on("voice:speaking", (payload: { speaking: boolean; operationId?: string }, ack?: Ack) =>
@@ -218,12 +221,13 @@ io.on("connection", (socket: Socket) => {
       const room = rooms.setVoiceSpeaking(user.id, Boolean(payload.speaking));
       emitRoom(room);
       return {};
-    })
+    }, { lockRoom: true })
   );
 
   socket.on("disconnect", () => {
-    const room = rooms.markConnected(user.id, false);
-    if (room) emitRoom(room);
+    userSockets.remove(user.id, socket.id);
+    if (userSockets.has(user.id)) return;
+    void markDisconnected(user).catch((error) => logSocketTaskError("disconnect", error));
   });
 });
 
@@ -232,7 +236,7 @@ httpServer.listen(port, "0.0.0.0", () => {
 });
 
 type Ack = (result: AckResult) => void;
-type HandleOptions = { checkStateVersion?: boolean; lockRoom?: boolean };
+type HandleOptions = { checkStateVersion?: boolean; lockRoom?: boolean; lockRoomId?: string };
 
 async function handle(event: string, socket: Socket, ack: Ack | undefined, payload: { actionId?: unknown; operationId?: unknown; stateVersion?: unknown }, work: () => Record<string, unknown>, options: HandleOptions = {}): Promise<void> {
   const user = socket.data.user as UserRecord;
@@ -251,8 +255,8 @@ async function handle(event: string, socket: Socket, ack: Ack | undefined, paylo
       ack?.(cached);
       return;
     }
-    if (options.checkStateVersion) rooms.assertFresh(user.id, payload.stateVersion);
-    const result = await withRoomLock(user.id, options.lockRoom, () => {
+    const result = await withRoomLock(options.lockRoomId ?? rooms.currentRoom(user.id)?.id, options.lockRoom || options.lockRoomId !== undefined, () => {
+      if (options.checkStateVersion) rooms.assertFresh(user.id, payload.stateVersion);
       const output = work();
       const currentRoom = rooms.currentRoom(user.id);
       return {
@@ -286,27 +290,53 @@ function emitRoom(room: Room): void {
   }
 }
 
-function resumeRoom(socket: Socket, user: UserRecord): void {
-  const room = rooms.markConnected(user.id, true);
-  if (!room) return;
-  socket.join(room.id);
-  socket.emit("room:state", rooms.publicRoom(room.id, user.id));
-  emitRoom(room);
+async function resumeRoom(socket: Socket, user: UserRecord): Promise<void> {
+  const current = rooms.currentRoom(user.id);
+  if (!current) return;
+  await roomLocks.run(current.id, () => {
+    const previousVersion = current.version;
+    const room = rooms.markConnected(user.id, true);
+    if (!room) return;
+    socket.join(room.id);
+    socket.emit("room:state", rooms.publicRoom(room.id, user.id));
+    emitRoom(room);
+    if (room.version !== previousVersion) scheduleRoomTimer(room);
+  });
+}
+
+async function markDisconnected(user: UserRecord): Promise<void> {
+  const current = rooms.currentRoom(user.id);
+  if (!current) return;
+  await roomLocks.run(current.id, () => {
+    const previousVersion = current.version;
+    const room = rooms.markConnected(user.id, false);
+    if (room) {
+      emitRoom(room);
+      if (room.version !== previousVersion) scheduleRoomTimer(room);
+    }
+  });
 }
 
 function scheduleRoomTimer(room: Room): void {
   const oldTimer = actionTimers.get(room.id);
   if (oldTimer) clearTimeout(oldTimer);
   actionTimers.delete(room.id);
-  if (room.status !== "playing" || !room.engine || room.engine.state.currentTurnSeat === null) return;
+  const deadline = Date.now() + room.rules.actionTimeoutSeconds * 1000;
+  const token = rooms.createActionTimerToken(room, deadline);
+  if (!token) return;
   actionTimers.set(
     room.id,
     setTimeout(() => {
-      const updated = rooms.autoAction(room.id);
-      emitRoom(updated);
-      emitRooms();
-      scheduleRoomTimer(updated);
-    }, room.rules.actionTimeoutSeconds * 1000)
+      void roomLocks
+        .run(token.roomId, () => {
+          const updated = rooms.autoActionIfCurrent(token);
+          if (!updated) return;
+          emitRoom(updated);
+          emitRooms();
+          scheduleRoomTimer(updated);
+        })
+        .catch((error) => console.error(JSON.stringify({ level: "error", event: "actionTimer", message: safeLogMessage(error) })));
+    }, Math.max(0, deadline - Date.now()))
   );
 }
 
@@ -459,9 +489,8 @@ function checkAuthLimit(req: IncomingMessage, username: unknown): void {
   if (!authLimiter.allow(`ip:${ip}`) || !authLimiter.allow(`user:${userKey}:${ip}`)) throw apiError("RATE_LIMITED", "请求过于频繁，请稍后再试", 429);
 }
 
-function withRoomLock<T>(userId: string, enabled: boolean | undefined, work: () => T | Promise<T>): T | Promise<T> {
+function withRoomLock<T>(roomId: string | undefined, enabled: boolean | undefined, work: () => T | Promise<T>): T | Promise<T> {
   if (!enabled) return work();
-  const roomId = rooms.currentRoom(userId)?.id;
   if (!roomId) return work();
   return roomLocks.run(roomId, work);
 }
@@ -488,6 +517,10 @@ function safeLogMessage(error: unknown): string {
 
 function logError(requestId: string, error: unknown): void {
   console.error(JSON.stringify({ level: "error", requestId, message: safeLogMessage(error) }));
+}
+
+function logSocketTaskError(event: string, error: unknown): void {
+  console.error(JSON.stringify({ level: "error", event, message: safeLogMessage(error) }));
 }
 
 function rateLimiter(maxHits: number, windowMs: number): { allow(key: string): boolean } {
