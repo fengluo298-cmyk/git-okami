@@ -18,7 +18,7 @@ import { apiRequest, AuthExpiredError, InvalidResponseError, NetworkError, Serve
 import { tokenStorage } from "./src/auth/tokenStorage";
 import { CardView } from "./src/components/CardView";
 import { ProgressBar } from "./src/components/ProgressBar";
-import { acceptAuthoritativeRoomState, type RoomStateSource } from "./src/roomState";
+import { acceptAuthoritativeRoomState, clearPendingSocketAction, prepareSocketAction, type PendingSocketAction, type RoomStateSource } from "./src/roomState";
 import { ErrorLimiter } from "./src/utils/errorLimiter";
 import type { Card } from "./src/utils/cards";
 import { parseChipAmountInRange } from "./src/utils/amount";
@@ -60,6 +60,7 @@ type RoomState = {
   status: "lobby" | "playing" | "finished";
   roomEpoch?: string;
   handId?: number;
+  actionDeadlineAt?: number | null;
   stateVersion?: number;
   rules: Rules;
   seats: Array<Seat | null>;
@@ -80,7 +81,10 @@ type RoomState = {
       minRaiseTo: number;
       maxRaiseTo: number;
       canCheck: boolean;
+      canCall: boolean;
       canBet: boolean;
+      canRaise: boolean;
+      canAllIn: boolean;
     };
   };
 };
@@ -113,7 +117,7 @@ export default function App() {
   const resumeTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastResumeAtRef = useRef(0);
   const appStateRef = useRef(AppState.currentState);
-  const pendingActionIds = useRef<Record<string, string>>({});
+  const pendingActions = useRef<Record<string, PendingSocketAction>>({});
   const [apiBase, setApiBase] = useState(defaultApiBase);
   const [socketUrl, setSocketUrl] = useState(defaultSocketUrl);
   const [token, setToken] = useState("");
@@ -334,7 +338,7 @@ export default function App() {
       replaceRoomState(null);
       setRooms([]);
       setUpgradeInfo(null);
-      pendingActionIds.current = {};
+      pendingActions.current = {};
       setPendingOps({});
       setRaiseTo("");
       setStatus("idle");
@@ -358,7 +362,6 @@ export default function App() {
       setStatus("online");
       setLastError("");
       setAuthState("authenticated");
-      requestRoomResume("socket-connect");
     });
     next.on("session", setUser);
     next.on("rooms:list", setRooms);
@@ -369,7 +372,7 @@ export default function App() {
       setLastError(zhMessage(reason));
     });
     next.io.on("reconnect_attempt", () => setStatus("reconnecting"));
-    next.io.on("reconnect", () => requestRoomResume("reconnect"));
+    next.io.on("reconnect", () => setStatus("online"));
     next.on("connect_error", (error) => {
       if (setUpgradeFromSocketError(error)) return;
       setStatus("offline");
@@ -450,10 +453,8 @@ export default function App() {
       return;
     }
     setPendingOps((prev) => ({ ...prev, [key]: true }));
-    const actionId = pendingActionIds.current[key] ?? `${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}`;
-    pendingActionIds.current[key] = actionId;
-    const stateVersion = roomRef.current?.stateVersion;
-    socket.timeout(6000).emit(event, { ...payload, ...(typeof stateVersion === "number" ? { stateVersion } : {}), actionId }, (error: Error | null, result?: { ok: boolean; error?: string; message?: string; [key: string]: unknown }) => {
+    const request = prepareSocketAction(pendingActions.current, key, event, payload, roomRef.current?.stateVersion, () => `${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}`);
+    socket.timeout(6000).emit(request.event, request.payload, (error: Error | null, result?: { ok: boolean; error?: string; message?: string; [key: string]: unknown }) => {
       if (!mountedRef.current) return;
       setPendingOps((prev) => ({ ...prev, [key]: false }));
       if (error) {
@@ -461,8 +462,11 @@ export default function App() {
         requestRoomResume("action-timeout");
         return;
       }
-      delete pendingActionIds.current[key];
-      if (!result?.ok) return showError(result?.message ?? result?.error ?? "操作失败");
+      clearPendingSocketAction(pendingActions.current, key);
+      if (!result?.ok) {
+        if (result?.code === "STATE_VERSION_STALE") requestRoomResume("state-conflict");
+        return showError(result?.message ?? result?.error ?? "操作失败");
+      }
       if (Object.prototype.hasOwnProperty.call(result, "state")) applyAuthoritativeRoomState(readAckRoomState(result.state), sourceForEvent(event));
       onOk?.(result);
     });

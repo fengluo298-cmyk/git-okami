@@ -10,6 +10,7 @@ test("socket presence keeps a user online until the last socket disconnects", ()
 
   assert.equal(presence.has("user-a"), true);
   assert.equal(presence.socketCount("user-a"), 2);
+  assert.deepEqual(presence.ids("user-a").sort(), ["socket-a", "socket-b"]);
   assert.equal(presence.userCount(), 1);
 
   presence.remove("user-a", "socket-a");
@@ -19,6 +20,7 @@ test("socket presence keeps a user online until the last socket disconnects", ()
   presence.remove("user-a", "socket-b");
   assert.equal(presence.has("user-a"), false);
   assert.equal(presence.socketCount("user-a"), 0);
+  assert.deepEqual(presence.ids("user-a"), []);
   assert.equal(presence.userCount(), 0);
 });
 

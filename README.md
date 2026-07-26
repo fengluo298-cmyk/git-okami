@@ -6,7 +6,7 @@ Phone multiplayer Texas Hold'em for learning and entertainment only. It uses vir
 
 ```text
 server/
-  migrations/001_init.sql      # schema reference
+  migrations/*.sql             # schema reference
   src/auth.ts                  # bcrypt password hash, HS256 JWT, voice token
   src/db.ts                    # SQLite auto migration, users, chip ledger
   src/index.ts                 # HTTP auth API, Socket.IO auth/events/timers
@@ -34,6 +34,7 @@ Runtime auto-migration runs when the server starts. Applied versions are recorde
 
 ```text
 server/migrations/001_init.sql
+server/migrations/002_table_escrows.sql
 ```
 
 SQLite default:
@@ -53,7 +54,15 @@ Production must use a durable SQLite file. The server refuses `:memory:` and `/t
 Tables:
 
 - `users`: username, bcrypt password hash, nickname, avatar URL/code, persisted bank chips.
-- `chip_transactions`: signed ledger rows for buy-in, cash-out, win/loss, admin adjustment.
+- `chip_transactions`: signed ledger rows for buy-in, cash-out, win/loss, admin adjustment. `balance_scope=wallet` rows use bank-chip before/after balances; `balance_scope=table` rows use table-chip before/after balances.
+- `table_escrows`: table buy-ins currently held away from bank chips while a player is seated.
+
+Table chip recovery:
+
+- Sitting opens a table escrow in the same SQLite transaction as the bank debit and buy-in ledger row.
+- Standing or leaving cashes out the escrow in the same transaction as the bank credit and cash-out ledger row.
+- Completed hands persist each seated player's latest table chip count to escrow with the hand id.
+- MVP crash policy cancels in-progress hands on server restart. If no in-memory rooms exist, startup refunds orphaned escrows from the latest persisted table chip count, deletes the escrow, and records a `recovery_refund` ledger row. Re-running startup recovery is idempotent.
 
 Backup:
 

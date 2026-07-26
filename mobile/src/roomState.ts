@@ -4,6 +4,7 @@ export type AuthoritativeRoomState = {
   id: string;
   roomEpoch?: string;
   handId?: number | null;
+  actionDeadlineAt?: number | null;
   status: string;
   stateVersion?: number;
   game?: null | { handId?: number | null; [key: string]: unknown };
@@ -17,6 +18,35 @@ export type RoomStateDecision<T> = {
   duplicate?: boolean;
   needsResume?: boolean;
 };
+
+export type PendingSocketAction = {
+  event: string;
+  payload: Record<string, unknown>;
+};
+
+export function prepareSocketAction(
+  pending: Record<string, PendingSocketAction>,
+  key: string,
+  event: string,
+  payload: Record<string, unknown>,
+  stateVersion: unknown,
+  createActionId: () => string
+): { event: string; payload: Record<string, unknown>; retry: boolean } {
+  const existing = pending[key];
+  if (existing) return { event: existing.event, payload: { ...existing.payload }, retry: true };
+
+  const outbound = {
+    ...payload,
+    ...(typeof stateVersion === "number" ? { stateVersion } : {}),
+    actionId: createActionId()
+  };
+  pending[key] = { event, payload: outbound };
+  return { event, payload: { ...outbound }, retry: false };
+}
+
+export function clearPendingSocketAction(pending: Record<string, PendingSocketAction>, key: string): void {
+  delete pending[key];
+}
 
 export function acceptAuthoritativeRoomState<T extends AuthoritativeRoomState>(
   current: T | null,
@@ -57,7 +87,7 @@ export function acceptAuthoritativeRoomState<T extends AuthoritativeRoomState>(
 }
 
 export function normalizeRoomState<T extends AuthoritativeRoomState>(room: T): T {
-  return room.status !== "playing" && room.game !== null ? ({ ...room, game: null } as T) : room;
+  return room;
 }
 
 function isValidRoomState(room: AuthoritativeRoomState): boolean {
@@ -104,6 +134,7 @@ function toBusinessState(room: AuthoritativeRoomState): Record<string, unknown> 
     name: room.name,
     ownerId: room.ownerId,
     status: room.status,
+    actionDeadlineAt: room.actionDeadlineAt ?? null,
     rules: normalizePlainObject(room.rules),
     seats: normalizeSeats(room.seats),
     voice: normalizeVoice(room.voice),
@@ -129,7 +160,8 @@ function normalizeGame(game: unknown): unknown {
     smallBlind: game.smallBlind,
     bigBlind: game.bigBlind,
     showdown: game.showdown,
-    winners: normalizePlainArray(game.winners)
+    winners: normalizePlainArray(game.winners),
+    availableActions: normalizeAvailableActions(game.availableActions)
   });
 }
 
@@ -182,9 +214,25 @@ function normalizePlayers(value: unknown): unknown {
       allIn: player.allIn,
       acted: player.acted,
       connected: player.connected,
+      hand: normalizeCards(player.hand),
       cardCount: player.cardCount,
       isTurn: player.isTurn
     });
+  });
+}
+
+function normalizeAvailableActions(value: unknown): unknown {
+  if (value === null) return null;
+  if (!isPlainRecord(value)) return undefined;
+  return compactObject({
+    toCall: value.toCall,
+    minRaiseTo: value.minRaiseTo,
+    maxRaiseTo: value.maxRaiseTo,
+    canCheck: value.canCheck,
+    canCall: value.canCall,
+    canBet: value.canBet,
+    canRaise: value.canRaise,
+    canAllIn: value.canAllIn
   });
 }
 

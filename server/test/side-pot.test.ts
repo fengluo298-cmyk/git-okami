@@ -38,11 +38,39 @@ test("split pots divide odd chips starting left of the dealer", () => {
       player("left", 1, [c(14, "H"), c(13, "H")], 5),
       player("right", 2, [c(14, "D"), c(13, "D")], 5)
     ],
-    [c(2), c(4), c(6), c(8), c(10)],
+    [c(2, "C"), c(4, "D"), c(6, "H"), c(8, "C"), c(10, "D")],
     0
   ).awards;
 
   assert.deepEqual(amounts(result), { left: 8, right: 7 });
+});
+
+test("odd split chip skips the dealer until players to the left are paid", () => {
+  const result = settlePots(
+    [
+      player("dealer", 0, [c(14), c(13)], 5),
+      player("left", 1, [c(14, "H"), c(13, "H")], 5),
+      player("right", 2, [c(14, "D"), c(13, "D")], 5)
+    ],
+    [c(2, "C"), c(4, "D"), c(6, "H"), c(8, "C"), c(10, "D")],
+    0
+  ).awards;
+
+  assert.deepEqual(amounts(result), { left: 5, right: 5, dealer: 5 });
+});
+
+test("odd split chip goes to dealer-left winner when dealer is also a winner", () => {
+  const result = settlePots(
+    [
+      player("dealer", 0, [c(14), c(13)], 5),
+      player("left", 1, [c(14, "H"), c(13, "H")], 5),
+      player("right", 2, [c(12, "D"), c(11, "D")], 5, true)
+    ],
+    [c(2, "C"), c(4, "D"), c(6, "H"), c(8, "C"), c(10, "D")],
+    0
+  ).awards;
+
+  assert.deepEqual(amounts(result), { left: 8, dealer: 7 });
 });
 
 function amounts(awards: Array<{ playerId: string; amount: number }>): Record<string, number> {

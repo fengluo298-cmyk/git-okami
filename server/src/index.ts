@@ -1,5 +1,6 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
+import { isIP } from "node:net";
 import { Server, type Socket } from "socket.io";
 import { ClientUpgradeRequiredError, guestLogin, login, readMinimumClientBuild, register, requireClientBuild, signVoiceToken, verifyToken } from "./auth.js";
 import { AppDatabase, type UserRecord } from "./db.js";
@@ -8,6 +9,7 @@ import type { PlayerAction } from "./game/gameEngine.js";
 import { parseChipAmount } from "./amount.js";
 import { OperationDeduper, RoomActionQueue, type AckResult } from "./operations.js";
 import { SocketPresence } from "./socketPresence.js";
+import { createRateLimiter } from "./rateLimiter.js";
 
 const port = Number(process.env.PORT ?? 4000);
 const corsOrigin = readCorsOrigin("CORS_ORIGIN");
@@ -16,13 +18,24 @@ const minClientBuild = readMinimumClientBuild();
 const latestClientVersion = process.env.LATEST_CLIENT_VERSION ?? "1.0.2";
 const clientDownloadUrl = process.env.CLIENT_DOWNLOAD_URL?.trim() || null;
 const maxJsonBytes = Number(process.env.MAX_JSON_BYTES ?? 16_384);
+const trustProxyHops = readTrustProxyHops();
 const voiceEnabled = (process.env.VOICE_PROVIDER ?? "none") !== "none";
 const db = new AppDatabase();
+const runtimeLeaseOwnerId = db.acquireRuntimeLease();
+if (!runtimeLeaseOwnerId) throw new Error("Another server instance is active");
+db.recoverOrphanedTableEscrows(runtimeLeaseOwnerId);
+const runtimeLeaseHeartbeat = setInterval(() => {
+  if (!db.heartbeatRuntimeLease(runtimeLeaseOwnerId)) {
+    console.error(JSON.stringify({ level: "fatal", event: "runtimeLeaseLost" }));
+    process.exit(1);
+  }
+}, 10_000);
+runtimeLeaseHeartbeat.unref();
 const rooms = new RoomStore(db);
 const actionTimers = new Map<string, NodeJS.Timeout>();
 const userSockets = new SocketPresence();
 const operations = new OperationDeduper();
-const authLimiter = rateLimiter(20, 15 * 60_000);
+const authLimiter = createRateLimiter(20, 15 * 60_000, { maxKeys: 10_000 });
 const roomLocks = new RoomActionQueue();
 
 process.on("unhandledRejection", (reason) => {
@@ -32,6 +45,16 @@ process.on("unhandledRejection", (reason) => {
 process.on("uncaughtException", (error) => {
   console.error(JSON.stringify({ level: "error", event: "uncaughtException", message: safeLogMessage(error) }));
   process.exit(1);
+});
+
+process.once("exit", cleanupRuntime);
+process.once("SIGTERM", () => {
+  cleanupRuntime();
+  process.exit(0);
+});
+process.once("SIGINT", () => {
+  cleanupRuntime();
+  process.exit(0);
 });
 
 const httpServer = createServer(async (req, res) => {
@@ -96,29 +119,29 @@ io.use((socket, next) => {
 });
 
 io.on("connection", (socket: Socket) => {
-  const user = socket.data.user as UserRecord;
-  userSockets.add(user.id, socket.id);
-  socket.emit("session", user);
+  const userId = currentSocketUser(socket).id;
+  userSockets.add(userId, socket.id);
+  socket.emit("session", currentSocketUser(socket));
   socket.emit("rooms:list", rooms.listRooms());
-  void resumeRoom(socket, user).catch((error) => logSocketTaskError("rooms:resume", error));
+  void resumeRoom(socket).catch((error) => logSocketTaskError("rooms:resume", error));
 
   socket.on("rooms:list", () => socket.emit("rooms:list", rooms.listRooms()));
-  socket.on("rooms:resume", () => void resumeRoom(socket, user).catch((error) => logSocketTaskError("rooms:resume", error)));
+  socket.on("rooms:resume", () => void resumeRoom(socket).catch((error) => logSocketTaskError("rooms:resume", error)));
 
   socket.on("rooms:create", (payload: { name?: string; rules?: Partial<RoomRules>; operationId?: string } = {}, ack?: Ack) =>
     handle("rooms:create", socket, ack, payload, () => {
-      const room = rooms.createRoom(user, payload.name, payload.rules);
-      socket.join(room.id);
-      socket.emit("room:state", rooms.publicRoom(room.id, user.id));
+      const room = rooms.createRoom(currentSocketUser(socket), payload.name, payload.rules);
+      joinUserSockets(userId, room.id);
+      emitRoom(room);
       emitRooms();
       return { roomId: room.id };
-    })
+    }, { lockRoomId: `user:${userId}:membership` })
   );
 
   socket.on("rooms:join", (payload: { roomId: string; operationId?: string }, ack?: Ack) =>
     handle("rooms:join", socket, ack, payload, () => {
-      const room = rooms.joinRoom(user, payload.roomId);
-      socket.join(room.id);
+      const room = rooms.joinRoom(currentSocketUser(socket), payload.roomId);
+      joinUserSockets(userId, room.id);
       emitRoom(room);
       emitRooms();
       return { roomId: room.id };
@@ -127,10 +150,10 @@ io.on("connection", (socket: Socket) => {
 
   socket.on("rooms:leave", (payload: { operationId?: string; stateVersion?: number } = {}, ack?: Ack) =>
     handle("rooms:leave", socket, ack, payload, () => {
-      const room = rooms.leaveRoom(user.id);
-      if (room) socket.leave(room.id);
-      socket.emit("room:state", null);
-      refreshSession(socket);
+      const room = rooms.leaveRoom(userId);
+      if (room) leaveUserSockets(userId, room.id);
+      emitToUser(userId, "room:state", null);
+      refreshUserSessions(userId);
       emitRooms();
       if (room) emitRoom(room);
       return {};
@@ -139,10 +162,10 @@ io.on("connection", (socket: Socket) => {
 
   socket.on("seat:sit", (payload: { seat: number; buyIn?: number | string; operationId?: string; stateVersion?: number }, ack?: Ack) =>
     handle("seat:sit", socket, ack, payload, () => {
-      const current = rooms.currentRoom(user.id);
+      const current = rooms.currentRoom(userId);
       const buyIn = parseChipAmount(payload.buyIn ?? current?.rules.minBuyIn ?? 1000, "Buy-in");
-      const room = rooms.sit(user, payload.seat, buyIn);
-      refreshSession(socket);
+      const room = rooms.sit(currentSocketUser(socket), payload.seat, buyIn);
+      refreshUserSessions(userId);
       emitRoom(room);
       emitRooms();
       return {};
@@ -151,8 +174,8 @@ io.on("connection", (socket: Socket) => {
 
   socket.on("seat:leave", (payload: { operationId?: string; stateVersion?: number } = {}, ack?: Ack) =>
     handle("seat:leave", socket, ack, payload, () => {
-      const room = rooms.leaveSeat(user.id);
-      refreshSession(socket);
+      const room = rooms.leaveSeat(userId);
+      refreshUserSessions(userId);
       emitRoom(room);
       emitRooms();
       return {};
@@ -161,7 +184,7 @@ io.on("connection", (socket: Socket) => {
 
   socket.on("seat:ready", (payload: { ready: boolean; operationId?: string; stateVersion?: number }, ack?: Ack) =>
     handle("seat:ready", socket, ack, payload, () => {
-      const room = rooms.setReady(user.id, Boolean(payload.ready));
+      const room = rooms.setReady(userId, Boolean(payload.ready));
       emitRoom(room);
       return {};
     }, { checkStateVersion: true, lockRoom: true })
@@ -169,10 +192,10 @@ io.on("connection", (socket: Socket) => {
 
   socket.on("game:start", (payload: { operationId?: string; stateVersion?: number } = {}, ack?: Ack) =>
     handle("game:start", socket, ack, payload, () => {
-      const room = rooms.startGame(user.id);
+      const room = rooms.startGame(userId);
+      scheduleRoomTimer(room);
       emitRoom(room);
       emitRooms();
-      scheduleRoomTimer(room);
       return {};
     }, { checkStateVersion: true, lockRoom: true })
   );
@@ -180,10 +203,10 @@ io.on("connection", (socket: Socket) => {
   socket.on("game:action", (payload: { type: PlayerAction; amount?: number | string; operationId?: string; stateVersion?: number }, ack?: Ack) =>
     handle("game:action", socket, ack, payload, () => {
       const amount = payload.amount === undefined ? undefined : parseChipAmount(payload.amount, "Bet");
-      const room = rooms.action(user.id, payload.type, amount);
+      const room = rooms.action(userId, payload.type, amount);
+      scheduleRoomTimer(room);
       emitRoom(room);
       emitRooms();
-      scheduleRoomTimer(room);
       return {};
     }, { checkStateVersion: true, lockRoom: true })
   );
@@ -191,16 +214,16 @@ io.on("connection", (socket: Socket) => {
   socket.on("voice:join", (payload: { operationId?: string } = {}, ack?: Ack) =>
     handle("voice:join", socket, ack, payload, () => {
       if (!voiceEnabled) throw new Error("Voice is not available");
-      const room = rooms.joinVoice(user.id);
+      const room = rooms.joinVoice(userId);
       emitRoom(room);
-      return { voiceToken: signVoiceToken(user.id, room.id), roomId: room.id };
+      return { voiceToken: signVoiceToken(userId, room.id), roomId: room.id };
     }, { lockRoom: true })
   );
 
   socket.on("voice:leave", (payload: { operationId?: string } = {}, ack?: Ack) =>
     handle("voice:leave", socket, ack, payload, () => {
       if (!voiceEnabled) throw new Error("Voice is not available");
-      const room = rooms.leaveVoice(user.id);
+      const room = rooms.leaveVoice(userId);
       emitRoom(room);
       return {};
     }, { lockRoom: true })
@@ -209,7 +232,7 @@ io.on("connection", (socket: Socket) => {
   socket.on("voice:mute", (payload: { muted: boolean; operationId?: string }, ack?: Ack) =>
     handle("voice:mute", socket, ack, payload, () => {
       if (!voiceEnabled) throw new Error("Voice is not available");
-      const room = rooms.setVoiceMuted(user.id, Boolean(payload.muted));
+      const room = rooms.setVoiceMuted(userId, Boolean(payload.muted));
       emitRoom(room);
       return {};
     }, { lockRoom: true })
@@ -218,16 +241,16 @@ io.on("connection", (socket: Socket) => {
   socket.on("voice:speaking", (payload: { speaking: boolean; operationId?: string }, ack?: Ack) =>
     handle("voice:speaking", socket, ack, payload, () => {
       if (!voiceEnabled) throw new Error("Voice is not available");
-      const room = rooms.setVoiceSpeaking(user.id, Boolean(payload.speaking));
+      const room = rooms.setVoiceSpeaking(userId, Boolean(payload.speaking));
       emitRoom(room);
       return {};
     }, { lockRoom: true })
   );
 
   socket.on("disconnect", () => {
-    userSockets.remove(user.id, socket.id);
-    if (userSockets.has(user.id)) return;
-    void markDisconnected(user).catch((error) => logSocketTaskError("disconnect", error));
+    userSockets.remove(userId, socket.id);
+    if (userSockets.has(userId)) return;
+    void markDisconnected(userId).catch((error) => logSocketTaskError("disconnect", error));
   });
 });
 
@@ -239,7 +262,7 @@ type Ack = (result: AckResult) => void;
 type HandleOptions = { checkStateVersion?: boolean; lockRoom?: boolean; lockRoomId?: string };
 
 async function handle(event: string, socket: Socket, ack: Ack | undefined, payload: { actionId?: unknown; operationId?: unknown; stateVersion?: unknown }, work: () => Record<string, unknown>, options: HandleOptions = {}): Promise<void> {
-  const user = socket.data.user as UserRecord;
+  const user = currentSocketUser(socket);
   const requestId = randomUUID();
   try {
     const actionId = payload.actionId ?? payload.operationId;
@@ -250,26 +273,28 @@ async function handle(event: string, socket: Socket, ack: Ack | undefined, paylo
       event,
       payload
     });
-    const cached = operations.get(scope);
-    if (cached) {
-      ack?.(cached);
-      return;
-    }
-    const result = await withRoomLock(options.lockRoomId ?? rooms.currentRoom(user.id)?.id, options.lockRoom || options.lockRoomId !== undefined, () => {
-      if (options.checkStateVersion) rooms.assertFresh(user.id, payload.stateVersion);
-      const output = work();
-      const currentRoom = rooms.currentRoom(user.id);
-      return {
-        ok: true,
-        code: "OK",
-        actionId: scope.actionId,
-        ...output,
-        stateVersion: currentRoom?.version,
-        state: currentRoom ? rooms.publicRoom(currentRoom.id, user.id) : null
-      };
-    });
-    operations.set(scope, result);
-    if (scope.roomId !== "lobby" && !rooms.roomById(scope.roomId)) operations.deleteRoom(scope.roomId);
+    const result = await operations.run(scope, async () =>
+      withRoomLock(options.lockRoomId ?? rooms.currentRoom(user.id)?.id, options.lockRoom || options.lockRoomId !== undefined, () => {
+        try {
+          if (options.checkStateVersion) rooms.assertFresh(user.id, payload.stateVersion);
+          const output = work();
+          const currentRoom = rooms.currentRoom(user.id);
+          return {
+            ok: true,
+            code: "OK",
+            actionId: scope.actionId,
+            ...output,
+            stateVersion: currentRoom?.version,
+            state: currentRoom ? rooms.publicRoom(currentRoom.id, user.id) : null
+          };
+        } catch (error) {
+          const publicError = toPublicError(error);
+          return { ...errorPayload(publicError, requestId), actionId: scope.actionId, stateVersion: rooms.currentRoom(user.id)?.version };
+        }
+      }),
+      shouldCacheOperationResult
+    );
+    if (!result.ok) socket.emit("error:message", { message: result.message, code: result.code, requestId: result.requestId });
     ack?.(result);
   } catch (error) {
     const publicError = toPublicError(error);
@@ -277,6 +302,12 @@ async function handle(event: string, socket: Socket, ack: Ack | undefined, paylo
     socket.emit("error:message", { message: publicError.message, code: publicError.code, requestId });
     ack?.(result);
   }
+}
+
+function shouldCacheOperationResult(result: AckResult): boolean {
+  if (result.ok) return true;
+  const code = typeof result.code === "string" ? result.code : "";
+  return !["INTERNAL_ERROR", "DATABASE_BUSY", "ROOM_BUSY", "LOCK_TIMEOUT", "ACTION_ID_CONFLICT"].includes(code);
 }
 
 function emitRooms(): void {
@@ -290,26 +321,26 @@ function emitRoom(room: Room): void {
   }
 }
 
-async function resumeRoom(socket: Socket, user: UserRecord): Promise<void> {
-  const current = rooms.currentRoom(user.id);
+async function resumeRoom(socket: Socket): Promise<void> {
+  const userId = currentSocketUser(socket).id;
+  const current = rooms.currentRoom(userId);
   if (!current) return;
   await roomLocks.run(current.id, () => {
     const previousVersion = current.version;
-    const room = rooms.markConnected(user.id, true);
+    const room = rooms.markConnected(userId, true);
     if (!room) return;
     socket.join(room.id);
-    socket.emit("room:state", rooms.publicRoom(room.id, user.id));
     emitRoom(room);
     if (room.version !== previousVersion) scheduleRoomTimer(room);
   });
 }
 
-async function markDisconnected(user: UserRecord): Promise<void> {
-  const current = rooms.currentRoom(user.id);
+async function markDisconnected(userId: string): Promise<void> {
+  const current = rooms.currentRoom(userId);
   if (!current) return;
   await roomLocks.run(current.id, () => {
     const previousVersion = current.version;
-    const room = rooms.markConnected(user.id, false);
+    const room = rooms.markConnected(userId, false);
     if (room) {
       emitRoom(room);
       if (room.version !== previousVersion) scheduleRoomTimer(room);
@@ -336,16 +367,42 @@ function scheduleRoomTimer(room: Room): void {
           scheduleRoomTimer(updated);
         })
         .catch((error) => console.error(JSON.stringify({ level: "error", event: "actionTimer", message: safeLogMessage(error) })));
-    }, Math.max(0, deadline - Date.now()))
+    }, Math.max(0, token.actionDeadlineAt - Date.now()))
   );
 }
 
-function refreshSession(socket: Socket): void {
-  const user = socket.data.user as UserRecord;
-  const fresh = db.getUser(user.id);
+function cleanupRuntime(): void {
+  clearInterval(runtimeLeaseHeartbeat);
+  for (const timer of actionTimers.values()) clearTimeout(timer);
+  actionTimers.clear();
+  db.releaseRuntimeLease(runtimeLeaseOwnerId);
+}
+
+function refreshUserSessions(userId: string): void {
+  const fresh = db.getUser(userId);
   if (!fresh) return;
-  socket.data.user = fresh;
-  socket.emit("session", fresh);
+  for (const socketId of userSockets.ids(userId)) {
+    const socket = io.sockets.sockets.get(socketId);
+    if (!socket) continue;
+    socket.data.user = fresh;
+    socket.emit("session", fresh);
+  }
+}
+
+function emitToUser(userId: string, event: string, payload: unknown): void {
+  for (const socketId of userSockets.ids(userId)) io.sockets.sockets.get(socketId)?.emit(event, payload);
+}
+
+function joinUserSockets(userId: string, roomId: string): void {
+  for (const socketId of userSockets.ids(userId)) io.sockets.sockets.get(socketId)?.join(roomId);
+}
+
+function leaveUserSockets(userId: string, roomId: string): void {
+  for (const socketId of userSockets.ids(userId)) io.sockets.sockets.get(socketId)?.leave(roomId);
+}
+
+function currentSocketUser(socket: Socket): UserRecord {
+  return socket.data.user as UserRecord;
 }
 
 async function readJson(req: IncomingMessage): Promise<Record<string, string>> {
@@ -416,6 +473,11 @@ function toPublicError(error: unknown): PublicError {
   if (message === "Invalid username or password") return apiError("AUTH_INVALID_CREDENTIALS", "用户名或密码错误", 401);
   if (message === "Missing token" || message === "Invalid token" || message === "Token expired" || message === "Unauthorized") return apiError("AUTH_INVALID_TOKEN", "登录已失效，请重新登录", 401);
   if (message === "Voice is not available") return apiError("VOICE_UNAVAILABLE", "语音功能开发中", 409);
+  if (message === "Already in a room") return apiError("ALREADY_IN_ROOM", "Already in a room", 409);
+  if (message === "Spectators are not allowed") return apiError("SPECTATORS_NOT_ALLOWED", "Spectators are not allowed", 403);
+  if (message === "Room rules are invalid") return apiError("ROOM_RULES_INVALID", "Room rules are invalid", 400);
+  if (message === "State version is required") return apiError("STATE_VERSION_REQUIRED", "State version is required", 400);
+  if (message === "State version is invalid") return apiError("STATE_VERSION_INVALID", "State version is invalid", 400);
   if (message === "State version is stale") return apiError("STATE_VERSION_STALE", "牌桌状态已更新，请重试", 409);
   if (message === "Room is busy") return apiError("ROOM_BUSY", "牌桌正在处理上一项操作，请稍后重试", 409);
   if (message === "Action id is required") return apiError("ACTION_ID_REQUIRED", "操作编号缺失，请同步牌桌后重试", 400);
@@ -455,6 +517,11 @@ function knownClientError(message: string): boolean {
     "Join voice first",
     "Join a room first",
     "Room not found",
+    "Already in a room",
+    "Spectators are not allowed",
+    "Room rules are invalid",
+    "State version is required",
+    "State version is invalid",
     "At least five cards are required",
     "At least two players are required",
     "Player is not in this hand",
@@ -484,9 +551,19 @@ function clientVersionMeta(): { latestVersion: string; downloadUrl: string | nul
 }
 
 function checkAuthLimit(req: IncomingMessage, username: unknown): void {
-  const ip = req.socket.remoteAddress ?? "unknown";
+  const ip = clientIp(req);
   const userKey = typeof username === "string" ? username.trim().toLowerCase().slice(0, 32) : "unknown";
   if (!authLimiter.allow(`ip:${ip}`) || !authLimiter.allow(`user:${userKey}:${ip}`)) throw apiError("RATE_LIMITED", "请求过于频繁，请稍后再试", 429);
+}
+
+function clientIp(req: IncomingMessage): string {
+  const remote = req.socket.remoteAddress ?? "unknown";
+  if (trustProxyHops <= 0) return remote;
+  const header = req.headers["x-forwarded-for"];
+  if (typeof header !== "string") return remote;
+  const hops = header.split(",").map((part) => part.trim()).filter(Boolean);
+  const candidate = hops[hops.length - trustProxyHops];
+  return candidate && isIP(candidate) ? candidate : remote;
 }
 
 function withRoomLock<T>(roomId: string | undefined, enabled: boolean | undefined, work: () => T | Promise<T>): T | Promise<T> {
@@ -510,6 +587,14 @@ function readCorsOrigin(name: string): string {
   return value;
 }
 
+function readTrustProxyHops(): number {
+  const raw = process.env.TRUST_PROXY_HOPS;
+  if (raw === undefined || raw.trim() === "") return 0;
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < 0 || value > 10) throw new Error("TRUST_PROXY_HOPS must be a safe integer from 0 to 10");
+  return value;
+}
+
 function safeLogMessage(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
   return message.replace(/Bearer\s+[A-Za-z0-9._-]+/g, "Bearer [redacted]").replace(/[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "[redacted-jwt]");
@@ -521,18 +606,4 @@ function logError(requestId: string, error: unknown): void {
 
 function logSocketTaskError(event: string, error: unknown): void {
   console.error(JSON.stringify({ level: "error", event, message: safeLogMessage(error) }));
-}
-
-function rateLimiter(maxHits: number, windowMs: number): { allow(key: string): boolean } {
-  const hits = new Map<string, number[]>();
-  return {
-    allow(key: string): boolean {
-    const now = Date.now();
-      const since = now - windowMs;
-      const recent = (hits.get(key) ?? []).filter((hit) => hit > since);
-      recent.push(now);
-      hits.set(key, recent);
-      return recent.length <= maxHits;
-    }
-  };
 }

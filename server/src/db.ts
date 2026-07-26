@@ -1,4 +1,4 @@
-import { mkdirSync } from "node:fs";
+import { mkdirSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
@@ -11,11 +11,12 @@ export type UserRecord = {
   chips: number;
 };
 
-export type ChipTransactionType = "buy_in" | "cash_out" | "win_pot" | "lose_bet" | "admin_adjust";
+export type ChipTransactionType = "buy_in" | "cash_out" | "win_pot" | "lose_bet" | "admin_adjust" | "recovery_refund";
 export type ChipTransaction = {
   id: string;
   user_id: string;
   type: ChipTransactionType;
+  balance_scope: "wallet" | "table";
   amount: number;
   before_chips: number;
   after_chips: number;
@@ -23,9 +24,19 @@ export type ChipTransaction = {
   hand_id: number | null;
   created_at: string;
 };
+export type TableEscrow = {
+  user_id: string;
+  room_id: string;
+  chips: number;
+  last_hand_id: number | null;
+  created_at: string;
+  updated_at: string;
+};
+export type TableHandStack = { userId: string; beforeChips: number; chips: number };
+type RuntimeLease = { lease_key: string; owner_id: string; heartbeat_at: string; expires_at: string };
 
 const DEFAULT_CHIPS = positiveInt(process.env.DEFAULT_CHIPS, 10000);
-const CURRENT_SCHEMA_VERSION = 1;
+const CURRENT_SCHEMA_VERSION = 2;
 
 export class AppDatabase {
   private readonly db: DatabaseSync;
@@ -48,30 +59,8 @@ export class AppDatabase {
       );
     `);
     this.assertKnownSchemaVersion();
-    this.applyMigration(1, `
-      create table if not exists users (
-        id text primary key,
-        username text,
-        password_hash text,
-        nickname text not null,
-        avatar_url text,
-        chips integer not null,
-        created_at text not null default current_timestamp,
-        updated_at text not null default current_timestamp
-      );
-      create table if not exists chip_transactions (
-        id text primary key,
-        user_id text not null,
-        type text not null,
-        amount integer not null,
-        before_chips integer not null,
-        after_chips integer not null,
-        room_id text,
-        hand_id integer,
-        created_at text not null default current_timestamp,
-        foreign key (user_id) references users(id)
-      );
-    `);
+    this.applyMigration(1, readMigration("001_init.sql"));
+    this.applyMigration(2, readMigration("002_table_escrows.sql"));
     this.addColumnIfMissing("users", "username", "text");
     this.addColumnIfMissing("users", "password_hash", "text");
     this.addColumnIfMissing("users", "avatar_url", "text");
@@ -81,6 +70,7 @@ export class AppDatabase {
   }
 
   close(): void {
+    this.releaseRuntimeLease();
     this.db.close();
   }
 
@@ -152,14 +142,159 @@ export class AppDatabase {
     }
   }
 
+  openTableEscrow(userId: string, roomId: string, chips: number): UserRecord {
+    assertChipAmount(chips, "Table escrow");
+    this.db.exec("begin immediate");
+    try {
+      if (this.getTableEscrow(userId)) throw new Error("Already seated");
+      const user = this.getUser(userId);
+      if (!user) throw new Error("User not found");
+      const after = user.chips - chips;
+      if (after < 0) throw new Error("Not enough chips");
+      this.db.prepare("update users set chips = ?, updated_at = current_timestamp where id = ?").run(after, userId);
+      this.logChipTransaction(userId, "buy_in", -chips, user.chips, after, roomId);
+      this.db.prepare("insert into table_escrows (user_id, room_id, chips) values (?, ?, ?)").run(userId, roomId, chips);
+      this.db.exec("commit");
+      return { ...user, chips: after };
+    } catch (error) {
+      this.db.exec("rollback");
+      throw error;
+    }
+  }
+
+  settleTableHand(roomId: string, handId: number, playerStacks: TableHandStack[]): void {
+    if (!Number.isSafeInteger(handId) || handId <= 0) throw new Error("Hand id must be a safe positive integer");
+    this.db.exec("begin immediate");
+    try {
+      const escrows = playerStacks.map((stack) => {
+        assertNonNegativeChipAmount(stack.beforeChips, "Table escrow before chips");
+        assertNonNegativeChipAmount(stack.chips, "Table escrow chips");
+        const escrow = this.getTableEscrow(stack.userId);
+        if (!escrow || escrow.room_id !== roomId) throw new Error("Table escrow missing");
+        return { stack, escrow };
+      });
+      if (escrows.every(({ escrow }) => escrow.last_hand_id === handId)) {
+        this.db.exec("commit");
+        return;
+      }
+      if (escrows.some(({ escrow }) => escrow.last_hand_id === handId)) throw new Error("Table settlement conflict");
+      for (const { stack, escrow } of escrows) {
+        if (escrow.chips !== stack.beforeChips) throw new Error("Table escrow changed");
+        const delta = stack.chips - stack.beforeChips;
+        if (delta !== 0) this.logChipTransaction(stack.userId, delta > 0 ? "win_pot" : "lose_bet", delta, stack.beforeChips, stack.chips, roomId, handId);
+        const updated = this.db
+          .prepare("update table_escrows set chips = ?, last_hand_id = ?, updated_at = current_timestamp where user_id = ? and room_id = ? and (last_hand_id is null or last_hand_id < ?)")
+          .run(stack.chips, handId, stack.userId, roomId, handId) as { changes: number };
+        if (updated.changes !== 1) throw new Error("Table settlement conflict");
+      }
+      this.db.exec("commit");
+    } catch (error) {
+      this.db.exec("rollback");
+      throw error;
+    }
+  }
+
+  cashOutTableEscrow(userId: string, roomId: string): UserRecord | null {
+    this.db.exec("begin immediate");
+    try {
+      const escrow = this.getTableEscrow(userId);
+      const user = this.getUser(userId);
+      if (!user) throw new Error("User not found");
+      if (!escrow || escrow.room_id !== roomId) {
+        this.db.exec("commit");
+        return user;
+      }
+      const after = user.chips + escrow.chips;
+      this.db.prepare("update users set chips = ?, updated_at = current_timestamp where id = ?").run(after, userId);
+      if (escrow.chips > 0) this.logChipTransaction(userId, "cash_out", escrow.chips, user.chips, after, roomId, escrow.last_hand_id ?? undefined);
+      this.db.prepare("delete from table_escrows where user_id = ?").run(userId);
+      this.db.exec("commit");
+      return { ...user, chips: after };
+    } catch (error) {
+      this.db.exec("rollback");
+      throw error;
+    }
+  }
+
+  recoverOrphanedTableEscrows(ownerId = this.leaseOwnerId, now = new Date()): number {
+    if (!ownerId) throw new Error("Runtime lease required");
+    const escrows = this.db.prepare("select * from table_escrows order by rowid").all() as TableEscrow[];
+    if (escrows.length === 0) return 0;
+    this.db.exec("begin immediate");
+    try {
+      this.assertRuntimeLease(ownerId, now);
+      for (const escrow of escrows) {
+        const user = this.getUser(escrow.user_id);
+        if (!user) {
+          this.db.prepare("delete from table_escrows where user_id = ?").run(escrow.user_id);
+          continue;
+        }
+        const after = user.chips + escrow.chips;
+        this.db.prepare("update users set chips = ?, updated_at = current_timestamp where id = ?").run(after, user.id);
+        if (escrow.chips > 0) this.logChipTransaction(user.id, "recovery_refund", escrow.chips, user.chips, after, escrow.room_id, escrow.last_hand_id ?? undefined);
+        this.db.prepare("delete from table_escrows where user_id = ?").run(user.id);
+      }
+      this.db.exec("commit");
+      return escrows.length;
+    } catch (error) {
+      this.db.exec("rollback");
+      throw error;
+    }
+  }
+
+  getTableEscrow(userId: string): TableEscrow | null {
+    return (this.db.prepare("select * from table_escrows where user_id = ?").get(userId) as TableEscrow | undefined) ?? null;
+  }
+
   logChipTransaction(userId: string, type: ChipTransactionType, amount: number, before: number, after: number, roomId?: string, handId?: number): void {
     this.db
-      .prepare("insert into chip_transactions (id, user_id, type, amount, before_chips, after_chips, room_id, hand_id) values (?, ?, ?, ?, ?, ?, ?, ?)")
-      .run(randomUUID(), userId, type, amount, before, after, roomId ?? null, handId ?? null);
+      .prepare("insert into chip_transactions (id, user_id, type, balance_scope, amount, before_chips, after_chips, room_id, hand_id) values (?, ?, ?, ?, ?, ?, ?, ?, ?)")
+      .run(randomUUID(), userId, type, chipTransactionScope(type), amount, before, after, roomId ?? null, handId ?? null);
   }
 
   getChipTransactions(userId: string): ChipTransaction[] {
     return this.db.prepare("select * from chip_transactions where user_id = ? order by rowid").all(userId) as ChipTransaction[];
+  }
+
+  private leaseOwnerId: string | null = null;
+
+  acquireRuntimeLease(ownerId: string = randomUUID(), ttlMs = 30_000, now = new Date()): string | null {
+    const nowIso = now.toISOString();
+    const expiresIso = new Date(now.getTime() + ttlMs).toISOString();
+    this.db.exec("begin immediate");
+    try {
+      const row = this.db.prepare("select * from server_runtime_lease where lease_key = 'server'").get() as RuntimeLease | undefined;
+      if (row && row.owner_id !== ownerId && row.expires_at > nowIso) {
+        this.db.exec("commit");
+        return null;
+      }
+      this.db
+        .prepare(
+          "insert into server_runtime_lease (lease_key, owner_id, heartbeat_at, expires_at) values ('server', ?, ?, ?) on conflict(lease_key) do update set owner_id = excluded.owner_id, heartbeat_at = excluded.heartbeat_at, expires_at = excluded.expires_at"
+        )
+        .run(ownerId, nowIso, expiresIso);
+      this.db.exec("commit");
+      this.leaseOwnerId = ownerId;
+      return ownerId;
+    } catch (error) {
+      this.db.exec("rollback");
+      throw error;
+    }
+  }
+
+  heartbeatRuntimeLease(ownerId = this.leaseOwnerId, ttlMs = 30_000, now = new Date()): boolean {
+    if (!ownerId) return false;
+    const result = this.db
+      .prepare("update server_runtime_lease set heartbeat_at = ?, expires_at = ? where lease_key = 'server' and owner_id = ?")
+      .run(now.toISOString(), new Date(now.getTime() + ttlMs).toISOString(), ownerId) as { changes: number };
+    return result.changes === 1;
+  }
+
+  releaseRuntimeLease(ownerId = this.leaseOwnerId): boolean {
+    if (!ownerId) return false;
+    const result = this.db.prepare("delete from server_runtime_lease where lease_key = 'server' and owner_id = ?").run(ownerId) as { changes: number };
+    if (result.changes === 1 && this.leaseOwnerId === ownerId) this.leaseOwnerId = null;
+    return result.changes === 1;
   }
 
   private rowToUser(row: unknown): (UserRecord & { passwordHash: string | null }) | null {
@@ -201,6 +336,11 @@ export class AppDatabase {
   private assertKnownSchemaVersion(): void {
     const row = this.db.prepare("select max(version) as version from schema_migrations").get() as { version: number | null };
     if ((row.version ?? 0) > CURRENT_SCHEMA_VERSION) throw new Error("Database schema is newer than this server");
+  }
+
+  private assertRuntimeLease(ownerId: string, now: Date): void {
+    const row = this.db.prepare("select * from server_runtime_lease where lease_key = 'server' and owner_id = ?").get(ownerId) as RuntimeLease | undefined;
+    if (!row || row.expires_at <= now.toISOString()) throw new Error("Runtime lease required");
   }
 }
 
@@ -244,6 +384,22 @@ export function assertDurableDatabaseFile(file: string): void {
 function positiveInt(value: unknown, fallback: number): number {
   const number = Math.floor(Number(value));
   return Number.isFinite(number) && number > 0 ? number : fallback;
+}
+
+function assertChipAmount(value: number, label: string): void {
+  if (!Number.isSafeInteger(value) || value <= 0) throw new Error(`${label} must be a safe positive integer`);
+}
+
+function assertNonNegativeChipAmount(value: number, label: string): void {
+  if (!Number.isSafeInteger(value) || value < 0) throw new Error(`${label} must be a safe non-negative integer`);
+}
+
+function chipTransactionScope(type: ChipTransactionType): "wallet" | "table" {
+  return type === "win_pot" || type === "lose_bet" ? "table" : "wallet";
+}
+
+function readMigration(fileName: string): string {
+  return readFileSync(new URL(`../migrations/${fileName}`, import.meta.url), "utf8");
 }
 
 function isProduction(): boolean {

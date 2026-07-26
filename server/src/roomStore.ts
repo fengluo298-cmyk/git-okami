@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { AppDatabase, UserRecord } from "./db.js";
+import type { AppDatabase, TableHandStack, UserRecord } from "./db.js";
 import { GameEngine, type BettingMode, type PlayerAction, type PublicGameState, type StartPlayer } from "./game/gameEngine.js";
 
 export type RoomStatus = "lobby" | "playing" | "finished";
@@ -36,13 +36,17 @@ export type Room = {
   version: number;
   handId: number;
   timerGeneration: number;
+  turnGeneration: number;
+  actionDeadlineAt: number | null;
+  timerTurnSeat: number | null;
+  timerHandId: number | null;
   seats: Array<RoomSeat | null>;
   members: Set<string>;
   voice: Map<string, { muted: boolean; speaking: boolean }>;
   engine: GameEngine | null;
   lastDealerSeat: number | null;
   rules: RoomRules;
-  settledHandIds: Set<number>;
+  lastSettledHandId: number | null;
 };
 
 export type PublicRoom = {
@@ -52,6 +56,7 @@ export type PublicRoom = {
   ownerId: string;
   status: RoomStatus;
   handId: number;
+  actionDeadlineAt: number | null;
   stateVersion: number;
   rules: RoomRules;
   seats: Array<RoomSeat | null>;
@@ -63,10 +68,9 @@ export type RoomTimerToken = {
   roomId: string;
   roomEpoch: string;
   handId: number;
-  stateVersion: number;
   currentTurnSeat: number | null;
-  timerGeneration: number;
-  deadline: number;
+  turnGeneration: number;
+  actionDeadlineAt: number;
 };
 
 export class RoomStore {
@@ -87,6 +91,7 @@ export class RoomStore {
   }
 
   createRoom(owner: UserRecord, name?: string, rules: Partial<RoomRules> = {}): Room {
+    if (this.userRoom.has(owner.id)) throw new Error("Already in a room");
     const fullRules = normalizeRules(rules);
     const room: Room = {
       id: randomUUID().slice(0, 8),
@@ -97,13 +102,17 @@ export class RoomStore {
       version: 1,
       handId: 0,
       timerGeneration: 0,
+      turnGeneration: 0,
+      actionDeadlineAt: null,
+      timerTurnSeat: null,
+      timerHandId: null,
       seats: Array.from({ length: fullRules.maxPlayers }, () => null),
       members: new Set([owner.id]),
       voice: new Map(),
       engine: null,
       lastDealerSeat: null,
       rules: fullRules,
-      settledHandIds: new Set()
+      lastSettledHandId: null
     };
     this.rooms.set(room.id, room);
     this.userRoom.set(owner.id, room.id);
@@ -113,10 +122,11 @@ export class RoomStore {
   joinRoom(user: UserRecord, roomId: string): Room {
     const room = this.mustRoom(roomId);
     const oldRoomId = this.userRoom.get(user.id);
-    if (oldRoomId && oldRoomId !== roomId) this.leaveRoom(user.id);
+    if (oldRoomId === roomId) return room;
+    if (oldRoomId) throw new Error("Already in a room");
+    if (room.status === "playing" && !room.rules.allowSpectators) throw new Error("Spectators are not allowed");
     room.members.add(user.id);
     this.userRoom.set(user.id, room.id);
-    this.markConnected(user.id, true);
     this.touch(room);
     return room;
   }
@@ -143,13 +153,14 @@ export class RoomStore {
     if (room.seats[seatNumber] && room.seats[seatNumber]?.id !== user.id) throw new Error("Seat is taken");
     const existing = room.seats.find((seat) => seat?.id === user.id);
     if (existing) {
+      if (existing.seat === seatNumber) return room;
       room.seats[existing.seat] = null;
       existing.seat = seatNumber;
       room.seats[seatNumber] = existing;
       return this.touch(room);
     }
     if (buyIn < room.rules.minBuyIn || buyIn > room.rules.maxBuyIn) throw new Error(`Buy-in must be ${room.rules.minBuyIn}-${room.rules.maxBuyIn}`);
-    this.db.adjustUserChips(user.id, -buyIn, "buy_in", room.id);
+    this.db.openTableEscrow(user.id, room.id, buyIn);
     room.seats[seatNumber] = {
       id: user.id,
       nickname: user.nickname,
@@ -207,24 +218,38 @@ export class RoomStore {
   action(userId: string, type: PlayerAction, amount?: number): Room {
     const room = this.mustCurrentRoom(userId);
     if (!room.engine) throw new Error("No active hand");
-    room.engine.executeAction(userId, type, amount);
-    if (room.engine.state.street === "finished") {
-      room.status = "finished";
-      this.syncFinishedHand(room);
+    const snapshot = snapshotMutableRoom(room);
+    try {
+      room.engine.executeAction(userId, type, amount);
+      if (room.engine.state.street === "finished") {
+        room.status = "finished";
+        this.syncFinishedHand(room);
+      }
+      this.invalidateTurnDeadline(room);
+      return this.touch(room);
+    } catch (error) {
+      restoreMutableRoom(room, snapshot);
+      throw error;
     }
-    return this.touch(room);
   }
 
   autoAction(roomId: string): Room {
     const room = this.mustRoom(roomId);
     if (!room.engine || room.engine.state.street === "finished") return room;
-    room.engine.autoAction();
-    const street = room.engine.state.street as string;
-    if (street === "finished") {
-      room.status = "finished";
-      this.syncFinishedHand(room);
+    const snapshot = snapshotMutableRoom(room);
+    try {
+      room.engine.autoAction();
+      const street = room.engine.state.street as string;
+      if (street === "finished") {
+        room.status = "finished";
+        this.syncFinishedHand(room);
+      }
+      this.invalidateTurnDeadline(room);
+      return this.touch(room);
+    } catch (error) {
+      restoreMutableRoom(room, snapshot);
+      throw error;
     }
-    return this.touch(room);
   }
 
   markConnected(userId: string, connected: boolean): Room | null {
@@ -247,16 +272,21 @@ export class RoomStore {
   }
 
   createActionTimerToken(room: Room, deadline: number): RoomTimerToken | null {
-    room.timerGeneration += 1;
     if (room.status !== "playing" || !room.engine || room.engine.state.currentTurnSeat === null) return null;
+    if (room.timerHandId !== room.handId || room.timerTurnSeat !== room.engine.state.currentTurnSeat || room.actionDeadlineAt === null) {
+      room.timerGeneration += 1;
+      room.turnGeneration += 1;
+      room.actionDeadlineAt = deadline;
+      room.timerTurnSeat = room.engine.state.currentTurnSeat;
+      room.timerHandId = room.handId;
+    }
     return {
       roomId: room.id,
       roomEpoch: room.roomEpoch,
       handId: room.handId,
-      stateVersion: room.version,
       currentTurnSeat: room.engine.state.currentTurnSeat,
-      timerGeneration: room.timerGeneration,
-      deadline
+      turnGeneration: room.turnGeneration,
+      actionDeadlineAt: room.actionDeadlineAt
     };
   }
 
@@ -271,8 +301,8 @@ export class RoomStore {
       room &&
         room.roomEpoch === token.roomEpoch &&
         room.handId === token.handId &&
-        room.version === token.stateVersion &&
-        room.timerGeneration === token.timerGeneration &&
+        room.turnGeneration === token.turnGeneration &&
+        room.actionDeadlineAt === token.actionDeadlineAt &&
         room.engine &&
         room.engine.state.currentTurnSeat === token.currentTurnSeat &&
         room.status === "playing"
@@ -316,24 +346,26 @@ export class RoomStore {
     const engine = room.engine;
     if (!engine) return;
     const handId = engine.state.handId;
-    if (!room.settledHandIds.has(handId)) {
-      room.settledHandIds.add(handId);
+    if (room.lastSettledHandId !== handId) {
+      const stacks: TableHandStack[] = engine.state.players.map((player) => {
+        const seat = room.seats[player.seat];
+        if (!seat) throw new Error("Table escrow missing");
+        return { userId: player.id, beforeChips: seat.handStartChips ?? seat.chips, chips: player.chips };
+      });
+      this.db.settleTableHand(room.id, handId, stacks);
       for (const player of engine.state.players) {
         const seat = room.seats[player.seat];
         if (!seat) continue;
-        const before = seat.handStartChips ?? seat.chips;
         seat.chips = player.chips;
         seat.handStartChips = player.chips;
-        const delta = player.chips - before;
-        if (delta !== 0) this.db.logChipTransaction(player.id, delta > 0 ? "win_pot" : "lose_bet", delta, before, player.chips, room.id, handId);
       }
+      room.lastSettledHandId = handId;
     }
-    room.engine = null;
-    room.status = "lobby";
+    this.clearTurnDeadline(room);
   }
 
   private cashOutSeat(room: Room, seat: RoomSeat): void {
-    if (seat.chips > 0) this.db.adjustUserChips(seat.id, seat.chips, "cash_out", room.id);
+    this.db.cashOutTableEscrow(seat.id, room.id);
     room.seats[seat.seat] = null;
   }
 
@@ -350,14 +382,29 @@ export class RoomStore {
   }
 
   assertFresh(userId: string, stateVersion: unknown): void {
-    if (stateVersion === undefined) return;
+    if (stateVersion === undefined) throw new Error("State version is required");
     const room = this.mustCurrentRoom(userId);
-    if (!Number.isSafeInteger(stateVersion) || stateVersion !== room.version) throw new Error("State version is stale");
+    if (!Number.isSafeInteger(stateVersion) || Number(stateVersion) < 0) throw new Error("State version is invalid");
+    if (stateVersion !== room.version) throw new Error("State version is stale");
   }
 
   private touch(room: Room): Room {
     room.version += 1;
     return room;
+  }
+
+  private invalidateTurnDeadline(room: Room): void {
+    room.actionDeadlineAt = null;
+    room.timerTurnSeat = null;
+    room.timerHandId = null;
+  }
+
+  private clearTurnDeadline(room: Room): void {
+    room.timerGeneration += 1;
+    room.turnGeneration += 1;
+    room.actionDeadlineAt = null;
+    room.timerTurnSeat = null;
+    room.timerHandId = null;
   }
 }
 
@@ -369,6 +416,7 @@ export function createRoomSnapshot(room: Room, viewerId: string): PublicRoom {
     ownerId: room.ownerId,
     status: room.status,
     handId: room.handId,
+    actionDeadlineAt: room.actionDeadlineAt,
     stateVersion: room.version,
     rules: { ...room.rules },
     seats: room.seats.map((seat) => (seat ? { ...seat } : null)),
@@ -399,23 +447,37 @@ function nextDealerSeat(players: RoomSeat[], lastDealerSeat: number | null): num
 }
 
 function normalizeRules(rules: Partial<RoomRules>): RoomRules {
-  const smallBlind = positiveInt(rules.smallBlind, envInt("DEFAULT_SMALL_BLIND", 10));
-  const bigBlind = Math.max(positiveInt(rules.bigBlind, envInt("DEFAULT_BIG_BLIND", 20)), smallBlind * 2);
-  const minBuyIn = positiveInt(rules.minBuyIn, envInt("DEFAULT_MIN_BUY_IN", 1000));
-  const maxBuyIn = Math.max(positiveInt(rules.maxBuyIn, envInt("DEFAULT_MAX_BUY_IN", 10000)), minBuyIn);
-  const maxPlayers = Math.min(6, Math.max(2, positiveInt(rules.maxPlayers, envInt("DEFAULT_MAX_PLAYERS", 6))));
+  if (!isPlainRules(rules)) throw new Error("Room rules are invalid");
+  const smallBlind = readRuleInt(rules, "smallBlind", envInt("DEFAULT_SMALL_BLIND", 10), 1, 1_000_000_000);
+  const bigBlind = readRuleInt(rules, "bigBlind", envInt("DEFAULT_BIG_BLIND", 20), 1, 1_000_000_000);
+  if (bigBlind < smallBlind * 2) throw new Error("Room rules are invalid");
+  const minBuyIn = readRuleInt(rules, "minBuyIn", envInt("DEFAULT_MIN_BUY_IN", 1000), 1, 1_000_000_000);
+  const maxBuyIn = readRuleInt(rules, "maxBuyIn", envInt("DEFAULT_MAX_BUY_IN", 10000), 1, 1_000_000_000);
+  if (maxBuyIn < minBuyIn) throw new Error("Room rules are invalid");
+  const maxPlayers = readRuleInt(rules, "maxPlayers", envInt("DEFAULT_MAX_PLAYERS", 6), 2, 6);
+  const bettingMode = rules.bettingMode ?? "no_limit";
+  if (bettingMode !== "no_limit" && bettingMode !== "pot_limit" && bettingMode !== "fixed_limit") throw new Error("Room rules are invalid");
+  if (rules.allowSpectators !== undefined && typeof rules.allowSpectators !== "boolean") throw new Error("Room rules are invalid");
+  const maxBetPerRound = rules.maxBetPerRound === undefined ? undefined : readRuleInt(rules, "maxBetPerRound", 0, bigBlind, 1_000_000_000);
   return {
     smallBlind,
     bigBlind,
     minBuyIn,
     maxBuyIn,
     maxPlayers,
-    bettingMode: rules.bettingMode ?? "no_limit",
-    minRaise: positiveInt(rules.minRaise, bigBlind),
-    maxBetPerRound: rules.maxBetPerRound ? positiveInt(rules.maxBetPerRound, rules.maxBetPerRound) : undefined,
-    actionTimeoutSeconds: positiveInt(rules.actionTimeoutSeconds, envInt("DEFAULT_ACTION_TIMEOUT_SECONDS", 30)),
+    bettingMode,
+    minRaise: readRuleInt(rules, "minRaise", bigBlind, bigBlind, 1_000_000_000),
+    maxBetPerRound,
+    actionTimeoutSeconds: readRuleInt(rules, "actionTimeoutSeconds", envInt("DEFAULT_ACTION_TIMEOUT_SECONDS", 30), 1, 300),
     allowSpectators: rules.allowSpectators ?? true
   };
+}
+
+function readRuleInt(rules: Partial<RoomRules>, key: keyof RoomRules, fallback: number, min: number, max: number): number {
+  const raw = (rules as Record<string, unknown>)[key];
+  if (raw === undefined) return fallback;
+  if (typeof raw !== "number" || !Number.isSafeInteger(raw) || raw < min || raw > max) throw new Error("Room rules are invalid");
+  return raw;
 }
 
 function positiveInt(value: unknown, fallback: number): number {
@@ -425,4 +487,37 @@ function positiveInt(value: unknown, fallback: number): number {
 
 function envInt(name: string, fallback: number): number {
   return positiveInt(process.env[name], fallback);
+}
+
+function isPlainRules(value: unknown): value is Partial<RoomRules> {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value) && (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null));
+}
+
+function snapshotMutableRoom(room: Room) {
+  return {
+    status: room.status,
+    version: room.version,
+    handId: room.handId,
+    turnGeneration: room.turnGeneration,
+    actionDeadlineAt: room.actionDeadlineAt,
+    timerTurnSeat: room.timerTurnSeat,
+    timerHandId: room.timerHandId,
+    lastSettledHandId: room.lastSettledHandId,
+    seats: room.seats.map((seat) => (seat ? { ...seat } : null)),
+    engineState: room.engine ? structuredClone(room.engine.state) : null
+  };
+}
+
+function restoreMutableRoom(room: Room, snapshot: ReturnType<typeof snapshotMutableRoom>): void {
+  room.status = snapshot.status;
+  room.version = snapshot.version;
+  room.handId = snapshot.handId;
+  room.turnGeneration = snapshot.turnGeneration;
+  room.actionDeadlineAt = snapshot.actionDeadlineAt;
+  room.timerTurnSeat = snapshot.timerTurnSeat;
+  room.timerHandId = snapshot.timerHandId;
+  room.lastSettledHandId = snapshot.lastSettledHandId;
+  room.seats = snapshot.seats.map((seat) => (seat ? { ...seat } : null));
+  if (room.engine && snapshot.engineState) room.engine.state = structuredClone(snapshot.engineState);
+  else room.engine = null;
 }

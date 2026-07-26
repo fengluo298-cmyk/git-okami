@@ -10,6 +10,112 @@ import { acceptAuthoritativeRoomState, type AuthoritativeRoomState } from "../..
 
 type Json = Record<string, any>;
 
+test("socket create join and leave retries are atomic across same-user sockets", async () => {
+  const server = await startServer();
+  const sockets: ClientSocket[] = [];
+  try {
+    const alpha = await register(server.port, "alpha_create_retry");
+    const beta = await register(server.port, "beta_create_retry");
+    const alphaOne = await connectPlayer(server.port, alpha.token);
+    const alphaTwo = await connectPlayer(server.port, alpha.token);
+    const betaSocket = await connectPlayer(server.port, beta.token);
+    sockets.push(alphaOne, alphaTwo, betaSocket);
+    const alphaOneStates: Json[] = [];
+    const alphaTwoStates: Json[] = [];
+    alphaOne.on("room:state", (state) => alphaOneStates.push(state));
+    alphaTwo.on("room:state", (state) => alphaTwoStates.push(state));
+
+    const actionId = unique("create_atomic");
+    const [first, second] = await Promise.all([
+      emitAck(alphaOne, "rooms:create", { actionId, name: "atomic" }),
+      emitAck(alphaTwo, "rooms:create", { actionId, name: "atomic" })
+    ]);
+    assert.deepEqual(second, first);
+    assert.equal(first.ok, true);
+    assert.equal(first.roomId, first.state.id);
+    await waitFor(() => alphaOneStates.some((state) => state?.id === first.roomId) && alphaTwoStates.some((state) => state?.id === first.roomId));
+    assert.deepEqual(await emitAck(alphaOne, "rooms:create", { actionId, name: "atomic" }), first);
+
+    const join = await emitAck(betaSocket, "rooms:join", { actionId: unique("join_retry"), roomId: first.roomId });
+    assert.equal(join.ok, true);
+    const joinRetry = await emitAck(betaSocket, "rooms:join", { actionId: join.actionId, roomId: first.roomId });
+    assert.deepEqual(joinRetry, join);
+
+    const latestAlpha = [...alphaOneStates].reverse().find((state: Json | null) => state?.id === first.roomId)!;
+    const leave = await emitAck(alphaOne, "rooms:leave", { actionId: unique("leave_retry"), stateVersion: latestAlpha.stateVersion });
+    assert.equal(leave.ok, true);
+    const leaveRetry = await emitAck(alphaTwo, "rooms:leave", { actionId: leave.actionId, stateVersion: latestAlpha.stateVersion });
+    assert.deepEqual(leaveRetry, leave);
+    await waitFor(() => alphaOneStates.at(-1) === null && alphaTwoStates.at(-1) === null);
+  } finally {
+    for (const socket of sockets) socket.disconnect();
+    await server.close();
+  }
+});
+
+test("mutable room socket events require an exact stateVersion", async () => {
+  const server = await startServer();
+  const sockets: ClientSocket[] = [];
+  try {
+    const alpha = await register(server.port, "alpha_version_required");
+    const beta = await register(server.port, "beta_version_required");
+    const alphaSocket = await connectPlayer(server.port, alpha.token);
+    const betaSocket = await connectPlayer(server.port, beta.token);
+    sockets.push(alphaSocket, betaSocket);
+
+    const created = await emitAck(alphaSocket, "rooms:create", { actionId: unique("create") });
+    assert.equal(created.ok, true);
+    assert.equal((await emitAck(betaSocket, "rooms:join", { actionId: unique("join"), roomId: created.roomId })).ok, true);
+    for (const [event, payload] of [
+      ["seat:sit", { seat: 0, buyIn: 1000 }],
+      ["seat:leave", {}],
+      ["seat:ready", { ready: true }],
+      ["game:start", {}],
+      ["game:action", { type: "check" }],
+      ["rooms:leave", {}]
+    ] as const) {
+      const result = await emitAck(alphaSocket, event, { actionId: unique(`missing_${event.replace(":", "_")}`), ...payload });
+      assert.equal(result.ok, false, event);
+      assert.equal(result.code, "STATE_VERSION_REQUIRED", event);
+    }
+  } finally {
+    for (const socket of sockets) socket.disconnect();
+    await server.close();
+  }
+});
+
+test("stale actionId failures are cached and different stateVersions conflict", async () => {
+  const server = await startServer();
+  const sockets: ClientSocket[] = [];
+  try {
+    const alpha = await register(server.port, "alpha_stale_retry");
+    const beta = await register(server.port, "beta_stale_retry");
+    const alphaSocket = await connectPlayer(server.port, alpha.token);
+    const betaSocket = await connectPlayer(server.port, beta.token);
+    sockets.push(alphaSocket, betaSocket);
+
+    const created = await emitAck(alphaSocket, "rooms:create", { actionId: unique("create") });
+    assert.equal(created.ok, true);
+    const actionId = unique("stale_sit");
+    const stale = await emitAck(alphaSocket, "seat:sit", { actionId, seat: 0, buyIn: 1000, stateVersion: created.stateVersion - 1 });
+    assert.equal(stale.ok, false);
+    assert.equal(stale.code, "STATE_VERSION_STALE");
+
+    const joined = await emitAck(betaSocket, "rooms:join", { actionId: unique("join"), roomId: created.roomId });
+    assert.equal(joined.ok, true);
+    const retry = await emitAck(alphaSocket, "seat:sit", { actionId, seat: 0, buyIn: 1000, stateVersion: created.stateVersion - 1 });
+    assert.deepEqual(retry, stale);
+
+    const conflict = await emitAck(alphaSocket, "seat:sit", { actionId, seat: 0, buyIn: 1000, stateVersion: joined.stateVersion });
+    assert.equal(conflict.ok, false);
+    assert.equal(conflict.code, "ACTION_ID_CONFLICT");
+    assert.equal(seat(joined.state, alpha.user.id), null);
+  } finally {
+    for (const socket of sockets) socket.disconnect();
+    await server.close();
+  }
+});
+
 test("socket game actionId retry returns the first result without replaying the action", async () => {
   const server = await startServer();
   const sockets: ClientSocket[] = [];
@@ -53,6 +159,10 @@ test("socket game actionId retry returns the first result without replaying the 
     assert.equal(changedPayload.ok, false);
     assert.equal(changedPayload.code, "ACTION_ID_CONFLICT");
     assert.equal(changedPayload.stateVersion, first.stateVersion);
+
+    const changedAmount = await emitAck(alphaSocket, "game:action", { actionId, type: "call", amount: 1, stateVersion: start.stateVersion });
+    assert.equal(changedAmount.ok, false);
+    assert.equal(changedAmount.code, "ACTION_ID_CONFLICT");
 
     const changedEvent = await emitAck(alphaSocket, "seat:ready", { actionId, ready: true, stateVersion: first.stateVersion });
     assert.equal(changedEvent.ok, false);
@@ -122,6 +232,35 @@ test("upgrade and health endpoints expose version state without requiring a clie
   }
 });
 
+test("auth rate limiter trusts forwarded addresses only with explicit proxy hops", async () => {
+  const noTrust = await startServer();
+  try {
+    let status = 0;
+    for (let index = 0; index < 21; index += 1) {
+      status = (await request(noTrust.port, "POST", "/auth/login", { username: `xff_plain_${index}`, password: "secret1" }, "3", { "x-forwarded-for": `198.51.100.${index}` })).status;
+    }
+    assert.equal(status, 429);
+  } finally {
+    await noTrust.close();
+  }
+
+  const trusted = await startServer({ TRUST_PROXY_HOPS: "1" });
+  try {
+    let status = 0;
+    for (let index = 0; index < 21; index += 1) {
+      status = (await request(trusted.port, "POST", "/auth/login", { username: `xff_trusted_${index}`, password: "secret1" }, "3", { "x-forwarded-for": `198.51.100.${index}` })).status;
+    }
+    assert.equal(status, 401);
+
+    for (let index = 0; index < 21; index += 1) {
+      status = (await request(trusted.port, "POST", "/auth/login", { username: `xff_bad_${index}`, password: "secret1" }, "3", { "x-forwarded-for": "not-an-ip" })).status;
+    }
+    assert.equal(status, 429);
+  } finally {
+    await trusted.close();
+  }
+});
+
 test("same user reconnect keeps the new socket online when the old socket disconnects", async () => {
   const server = await startServer();
   const sockets: ClientSocket[] = [];
@@ -138,8 +277,9 @@ test("same user reconnect keeps the new socket online when the old socket discon
 
     const created = await emitAck(alphaOld, "rooms:create", { actionId: unique("create") });
     assert.equal(created.ok, true);
-    assert.equal((await emitAck(betaSocket, "rooms:join", { actionId: unique("join"), roomId: created.roomId })).ok, true);
-    assert.equal((await emitAck(alphaOld, "seat:sit", { actionId: unique("sit_a"), seat: 0, buyIn: 1000 })).ok, true);
+    const joined = await emitAck(betaSocket, "rooms:join", { actionId: unique("join"), roomId: created.roomId });
+    assert.equal(joined.ok, true);
+    assert.equal((await emitAck(alphaOld, "seat:sit", { actionId: unique("sit_a"), seat: 0, buyIn: 1000, stateVersion: joined.stateVersion })).ok, true);
     await waitFor(() => betaState !== null && seat(betaState, alpha.user.id)?.connected === true);
 
     const alphaNew = await connectPlayer(server.port, alpha.token);
@@ -184,8 +324,10 @@ test("game action ack and broadcast share the same authoritative snapshot", asyn
     assert.equal(ack.ok, true);
     const broadcast = await waitForState(alphaStates, ack.stateVersion);
     assert.deepEqual(ack.state, broadcast);
+    assert.equal(typeof ack.state.actionDeadlineAt, "number");
     const betaBroadcast = await waitForState(betaStates, ack.stateVersion);
     assertPublicFieldsMatch(ack.state, betaBroadcast);
+    assert.equal(betaBroadcast.actionDeadlineAt, ack.state.actionDeadlineAt);
 
     const broadcastCount = alphaStates.filter((state) => state.stateVersion === ack.stateVersion).length;
     assert.equal(broadcastCount, 1);
@@ -233,8 +375,8 @@ test("non-current player reconnect does not orphan or duplicate the action timer
     const versionAfterReconnect = latestAlpha!.stateVersion;
     await waitFor(() => latestAlpha !== null && latestAlpha.stateVersion > versionAfterReconnect, 2500);
     const versionAfterTimeout = latestAlpha!.stateVersion;
-    assert.equal(latestAlpha!.status, "lobby");
-    assert.equal(latestAlpha!.game, null);
+    assert.equal(latestAlpha!.status, "finished");
+    assert.ok(latestAlpha!.game);
 
     await delay(300);
     assert.equal(latestAlpha!.stateVersion, versionAfterTimeout);
@@ -276,7 +418,7 @@ test("two socket clients keep public state synchronized through a hand and recon
     await actCurrent(latest, alpha, beta, alphaSocket, betaSocket, "check");
     await actCurrent(latest, alpha, beta, alphaSocket, betaSocket, "check");
     await actCurrent(latest, alpha, beta, alphaSocket, betaSocket, "check");
-    assert.equal(latest.alpha!.status, "lobby");
+    assert.equal(latest.alpha!.status, "finished");
 
     await ready(latest, alphaSocket, betaSocket);
     const nextHand = await emitAck(alphaSocket, "game:start", { actionId: unique("next"), stateVersion: latest.alpha!.stateVersion });
@@ -310,12 +452,17 @@ async function startHeadsUpRoom(alpha: ClientSocket, beta: ClientSocket, rules: 
   const created = await emitAck(alpha, "rooms:create", { actionId: unique("create"), rules });
   assert.equal(created.ok, true);
   const roomId = created.roomId;
-  assert.equal((await emitAck(beta, "rooms:join", { actionId: unique("join"), roomId })).ok, true);
-  assert.equal((await emitAck(alpha, "seat:sit", { actionId: unique("sit_a"), seat: 0, buyIn: 1000 })).ok, true);
-  assert.equal((await emitAck(beta, "seat:sit", { actionId: unique("sit_b"), seat: 1, buyIn: 1000 })).ok, true);
-  assert.equal((await emitAck(alpha, "seat:ready", { actionId: unique("ready_a"), ready: true })).ok, true);
-  assert.equal((await emitAck(beta, "seat:ready", { actionId: unique("ready_b"), ready: true })).ok, true);
-  const started = await emitAck(alpha, "game:start", { actionId: unique("start") });
+  const joined = await emitAck(beta, "rooms:join", { actionId: unique("join"), roomId });
+  assert.equal(joined.ok, true);
+  const sitAlpha = await emitAck(alpha, "seat:sit", { actionId: unique("sit_a"), seat: 0, buyIn: 1000, stateVersion: joined.stateVersion });
+  assert.equal(sitAlpha.ok, true);
+  const sitBeta = await emitAck(beta, "seat:sit", { actionId: unique("sit_b"), seat: 1, buyIn: 1000, stateVersion: sitAlpha.stateVersion });
+  assert.equal(sitBeta.ok, true);
+  const readyAlpha = await emitAck(alpha, "seat:ready", { actionId: unique("ready_a"), ready: true, stateVersion: sitBeta.stateVersion });
+  assert.equal(readyAlpha.ok, true);
+  const readyBeta = await emitAck(beta, "seat:ready", { actionId: unique("ready_b"), ready: true, stateVersion: readyAlpha.stateVersion });
+  assert.equal(readyBeta.ok, true);
+  const started = await emitAck(alpha, "game:start", { actionId: unique("start"), stateVersion: readyBeta.stateVersion });
   assert.equal(started.ok, true);
   return started.state;
 }
@@ -326,12 +473,13 @@ async function register(port: number, username: string): Promise<Json> {
   return response.body;
 }
 
-async function request(port: number, method: string, path: string, body?: Json, clientBuild?: string): Promise<{ status: number; body: Json }> {
+async function request(port: number, method: string, path: string, body?: Json, clientBuild?: string, headers: Record<string, string> = {}): Promise<{ status: number; body: Json }> {
   const response = await fetch(`http://127.0.0.1:${port}${path}`, {
     method,
     headers: {
       ...(body ? { "content-type": "application/json" } : {}),
-      ...(clientBuild ? { "x-client-build": clientBuild } : {})
+      ...(clientBuild ? { "x-client-build": clientBuild } : {}),
+      ...headers
     },
     body: body ? JSON.stringify(body) : undefined
   });
@@ -370,7 +518,7 @@ async function emitAck(socket: ClientSocket, event: string, payload: Json): Prom
   });
 }
 
-async function startServer(): Promise<{ port: number; close: () => Promise<void> }> {
+async function startServer(env: Record<string, string> = {}): Promise<{ port: number; close: () => Promise<void> }> {
   const port = await freePort();
   const cwd = process.cwd().endsWith(`${sep}server`) ? process.cwd() : resolve("server");
   const child = spawn(process.execPath, ["--import", "tsx", "src/index.ts"], {
@@ -383,7 +531,8 @@ async function startServer(): Promise<{ port: number; close: () => Promise<void>
       JWT_SECRET: "test-secret-for-socket-action-id-1234567890",
       MIN_CLIENT_BUILD: "3",
       LATEST_CLIENT_VERSION: "1.0.2",
-      CLIENT_DOWNLOAD_URL: "https://example.invalid/git-okami.apk"
+      CLIENT_DOWNLOAD_URL: "https://example.invalid/git-okami.apk",
+      ...env
     }
   });
   const logs: string[] = [];
@@ -493,8 +642,8 @@ function assertPublicFieldsMatch(left: Json, right: Json): void {
   assert.deepEqual(publicFields(left), publicFields(right));
   const leftHands = left.game?.players.map((candidate: Json) => candidate.hand).filter(Boolean) ?? [];
   const rightHands = right.game?.players.map((candidate: Json) => candidate.hand).filter(Boolean) ?? [];
-  assert.equal(leftHands.length <= 1, true);
-  assert.equal(rightHands.length <= 1, true);
+  if (!left.game?.showdown) assert.equal(leftHands.length <= 1, true);
+  if (!right.game?.showdown) assert.equal(rightHands.length <= 1, true);
 }
 
 function publicFields(state: Json): Json {

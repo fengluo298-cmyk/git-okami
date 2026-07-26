@@ -18,6 +18,10 @@ export class SocketPresence {
     return (this.socketsByUser.get(userId)?.size ?? 0) > 0;
   }
 
+  ids(userId: string): string[] {
+    return [...(this.socketsByUser.get(userId) ?? [])];
+  }
+
   userCount(): number {
     return this.socketsByUser.size;
   }

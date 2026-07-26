@@ -510,7 +510,7 @@ function copyCard(card: Card): Card {
 }
 
 function orderWinners(winners: EnginePlayer[], dealerSeat: number): EnginePlayer[] {
-  return [...winners].sort((a, b) => ((a.seat - dealerSeat + 6) % 6) - ((b.seat - dealerSeat + 6) % 6));
+  return [...winners].sort((a, b) => ((a.seat - dealerSeat + 5) % 6) - ((b.seat - dealerSeat + 5) % 6));
 }
 
 function normalizeGameRules(input: Partial<GameRules> | { small: number; big: number }): GameRules {

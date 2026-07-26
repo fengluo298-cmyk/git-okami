@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { acceptAuthoritativeRoomState, type AuthoritativeRoomState } from "../src/roomState";
+import { acceptAuthoritativeRoomState, clearPendingSocketAction, prepareSocketAction, type AuthoritativeRoomState, type PendingSocketAction } from "../src/roomState";
 
 test("authoritative room state rejects stale duplicate and conflicting updates", () => {
   const current = room({ stateVersion: 5, handId: 1, board: [] });
@@ -40,6 +40,28 @@ test("authoritative room state accepts null only from leave", () => {
   const leave = acceptAuthoritativeRoomState(current, null, "leave");
   assert.equal(leave.accepted, true);
   assert.equal(leave.room, null);
+});
+
+test("finished authoritative room state preserves final game snapshot", () => {
+  const current = room({ stateVersion: 20 });
+  const finished = room({
+    stateVersion: 21,
+    status: "finished",
+    game: {
+      handId: 1,
+      street: "finished",
+      board: [{ rank: 14, suit: "S" }],
+      pot: 100,
+      winners: [{ playerId: "alpha", amount: 100, handName: "Pair" }],
+      currentTurnSeat: null,
+      players: []
+    }
+  });
+
+  const decision = acceptAuthoritativeRoomState(current, finished, "room:state");
+  assert.equal(decision.accepted, true);
+  assert.notEqual(decision.room?.game, null);
+  assert.deepEqual(decision.room?.game?.winners, [{ playerId: "alpha", amount: 100, handName: "Pair" }]);
 });
 
 test("authoritative room state accepts legal hand transitions without allowing stale hands", () => {
@@ -93,6 +115,36 @@ test("same version comparison ignores transport-only differences and detects bus
   assert.equal(boardConflict.reason, "same-version-conflict");
 });
 
+test("same version comparison includes viewer-private cards and action controls", () => {
+  const current = room({ stateVersion: 9 });
+  const missingHand = room({ stateVersion: 9 });
+  const currentGame = current.game as Record<string, any>;
+  const missingGame = missingHand.game as Record<string, any>;
+  currentGame.availableActions = { toCall: 20, minRaiseTo: 40, maxRaiseTo: 1000, canCheck: false, canCall: true, canBet: false, canRaise: true, canAllIn: true };
+  missingGame.availableActions = { toCall: 20, minRaiseTo: 40, maxRaiseTo: 1000, canCheck: false, canCall: true, canBet: false, canRaise: true, canAllIn: true };
+  currentGame.players[0].hand = [{ rank: 10, suit: "H" }, { rank: 11, suit: "H" }];
+
+  const handConflict = acceptAuthoritativeRoomState(current, missingHand, "room:state");
+  assert.equal(handConflict.accepted, false);
+  assert.equal(handConflict.reason, "same-version-conflict");
+
+  const changedAction = room({ stateVersion: 9 });
+  const changedGame = changedAction.game as Record<string, any>;
+  changedGame.availableActions = { toCall: 0, minRaiseTo: 40, maxRaiseTo: 1000, canCheck: true, canCall: false, canBet: true, canRaise: false, canAllIn: true };
+  const actionConflict = acceptAuthoritativeRoomState(current, changedAction, "ack");
+  assert.equal(actionConflict.accepted, false);
+  assert.equal(actionConflict.reason, "same-version-conflict");
+});
+
+test("same version comparison includes the authoritative action deadline", () => {
+  const current = room({ stateVersion: 9, actionDeadlineAt: 1000 });
+  const changed = room({ stateVersion: 9, actionDeadlineAt: 2000 });
+
+  const conflict = acceptAuthoritativeRoomState(current, changed, "room:state");
+  assert.equal(conflict.accepted, false);
+  assert.equal(conflict.reason, "same-version-conflict");
+});
+
 test("ack and broadcast snapshots with the same version apply only once in either order", () => {
   const initial = room({ stateVersion: 10, pot: 20 });
   const ackSnapshot = room({ stateVersion: 11, pot: 40, serverTime: 1000 });
@@ -115,6 +167,23 @@ test("same version conflicts do not request another resume while one is already 
   assert.equal(conflict.accepted, false);
   assert.equal(conflict.reason, "same-version-conflict");
   assert.equal(conflict.needsResume, false);
+});
+
+test("socket action retry keeps the original action fingerprint until an ack arrives", () => {
+  const pending: Record<string, PendingSocketAction> = {};
+  let nextId = 1;
+  const first = prepareSocketAction(pending, "game:action", "game:action", { type: "call" }, 10, () => `action_${nextId++}`);
+  assert.equal(first.retry, false);
+  assert.deepEqual(first.payload, { type: "call", stateVersion: 10, actionId: "action_1" });
+
+  const timeoutRetry = prepareSocketAction(pending, "game:action", "game:action", { type: "raise", amount: 100 }, 11, () => `action_${nextId++}`);
+  assert.equal(timeoutRetry.retry, true);
+  assert.deepEqual(timeoutRetry.payload, first.payload);
+
+  clearPendingSocketAction(pending, "game:action");
+  const afterStaleResume = prepareSocketAction(pending, "game:action", "game:action", { type: "raise", amount: 100 }, 11, () => `action_${nextId++}`);
+  assert.equal(afterStaleResume.retry, false);
+  assert.deepEqual(afterStaleResume.payload, { type: "raise", amount: 100, stateVersion: 11, actionId: "action_2" });
 });
 
 function assertDuplicate(decision: ReturnType<typeof acceptAuthoritativeRoomState>): void {
@@ -153,6 +222,7 @@ function room(
     handId,
     stateVersion: overrides.stateVersion ?? 1,
     status: overrides.status ?? "playing",
+    actionDeadlineAt: Object.prototype.hasOwnProperty.call(overrides, "actionDeadlineAt") ? overrides.actionDeadlineAt : null,
     name: "Test Room",
     ownerId: "alpha",
     rules: overrides.rules ?? { smallBlind: 10, bigBlind: 20, maxPlayers: 6 },
