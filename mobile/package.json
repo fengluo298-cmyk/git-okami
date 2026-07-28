@@ -12,15 +12,22 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@react-native-async-storage/async-storage": "^3.1.1",
-    "expo": "~54.0.0",
-    "expo-secure-store": "~15.0.8",
-    "react": "19.1.0",
-    "react-native": "0.81.4",
+    "@react-native-async-storage/async-storage": "2.2.0",
+    "expo": "57.0.8",
+    "expo-secure-store": "~57.0.1",
+    "react": "19.2.3",
+    "react-native": "0.86.0",
     "socket.io-client": "^4.8.1"
   },
   "devDependencies": {
     "@types/react": "^19.1.0",
-    "typescript": "^5.8.0"
+    "typescript": "~6.0.3"
+  },
+  "expo": {
+    "doctor": {
+      "appConfigFieldsNotSyncedCheck": {
+        "enabled": false
+      }
+    }
   }
 }
