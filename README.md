@@ -102,11 +102,13 @@ Socket.IO requires:
 auth: { token: "JWT" }
 ```
 
-Current HTTP auth and Socket clients must send `clientBuild >= MIN_CLIENT_BUILD`. Keep `MIN_CLIENT_BUILD=2` until the build 3 APK is verified and downloadable:
+Current HTTP auth and Socket clients must send `clientBuild >= MIN_CLIENT_BUILD`. The current authoritative room protocol starts at build 3 because build 2 does not send `stateVersion` on mutable room operations:
 
 ```js
 auth: { token: "JWT", clientBuild: 3 }
 ```
+
+Do not configure this server with `MIN_CLIENT_BUILD=2`. Old build 2 clients are rejected during HTTP auth or Socket.IO handshake with `CLIENT_UPGRADE_REQUIRED` and `minimumBuild: 3`, instead of entering a room and failing later actions.
 
 ## Render Deploy
 
@@ -133,9 +135,9 @@ DEFAULT_MIN_BUY_IN=1000
 DEFAULT_MAX_BUY_IN=10000
 DEFAULT_MAX_PLAYERS=6
 DEFAULT_ACTION_TIMEOUT_SECONDS=30
-MIN_CLIENT_BUILD=2
+MIN_CLIENT_BUILD=3
 LATEST_CLIENT_VERSION=1.0.2
-CLIENT_DOWNLOAD_URL=
+CLIENT_DOWNLOAD_URL=<stable-https-apk-url>
 EXPO_PUBLIC_ALLOWED_DOWNLOAD_HOSTS=git-okami.onrender.com,github.com,github-releases.githubusercontent.com,objects.githubusercontent.com
 VOICE_PROVIDER=none
 ```
@@ -144,18 +146,20 @@ Do not set `DATABASE_PATH=DATABASE_PATH=...`. Do not use a Windows path such as 
 
 `/tmp/holdem.db` is blocked in production because it is not durable across restarts. Use a Render persistent disk with a Linux path like `/var/data/holdem.db`, or migrate to PostgreSQL before production traffic depends on persisted chips.
 
-`MIN_CLIENT_BUILD=2` is a local development default. In `NODE_ENV=production`, the server refuses to start unless `MIN_CLIENT_BUILD` is explicitly set to a valid non-negative integer. The Render Blueprint leaves this value as `sync: false`; set it manually in the Render Dashboard.
+`MIN_CLIENT_BUILD=3` is the current protocol default. The server accepts a higher explicit value for future forced upgrades and refuses invalid values such as blank, `0`, decimals, `NaN`, `Infinity`, and values outside JavaScript's safe integer range. The Render Blueprint leaves this value as `sync: false`; set it manually in the Render Dashboard.
 
 Client upgrade rollout:
 
-1. Build the new APK.
-2. Verify the new APK locally and on a phone.
-3. Put the APK at a real `CLIENT_DOWNLOAD_URL`.
-   If that URL is not on GitHub or `git-okami.onrender.com`, include its host in `EXPO_PUBLIC_ALLOWED_DOWNLOAD_HOSTS` before building the APK.
-4. Deploy the server while `MIN_CLIENT_BUILD` still allows the old build.
-5. Verify build 3 can register, log in, connect Socket, and finish a minimal hand.
-6. Raise `MIN_CLIENT_BUILD` to `3`.
-7. Roll back by lowering `MIN_CLIENT_BUILD` to `2` if users cannot upgrade.
+1. Build and sign the build 3 Release APK/AAB.
+2. Upload the APK to a stable HTTPS download URL.
+3. Verify the downloaded file SHA-256.
+4. Set `CLIENT_DOWNLOAD_URL` to that stable HTTPS URL.
+5. Set `MIN_CLIENT_BUILD=3`.
+6. Deploy the server.
+7. Use a build 2 client to verify the clear upgrade prompt.
+8. Use a build 3 client to verify login, Socket connection, and a complete hand.
+
+Do not switch the production gate until the build 3 APK is downloadable. If build 3 fails validation, fix or roll back the server release; do not lower this server to `MIN_CLIENT_BUILD=2`.
 
 ## Frontend
 

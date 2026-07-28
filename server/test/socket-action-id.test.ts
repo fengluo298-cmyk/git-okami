@@ -225,8 +225,30 @@ test("upgrade and health endpoints expose version state without requiring a clie
     assert.equal(typeof blocked.body.requestId, "string");
 
     const user = await register(server.port, "socket_upgrade");
+    const build3 = await connectPlayer(server.port, user.token, 3);
+    const build4 = await connectPlayer(server.port, user.token, 4);
+    assert.equal(build3.connected, true);
+    assert.equal(build4.connected, true);
+    build3.disconnect();
+    build4.disconnect();
+
+    const staleSocket = connectSocket(`http://127.0.0.1:${server.port}`, {
+      auth: { token: user.token, clientBuild: 2 },
+      autoConnect: false,
+      reconnection: false,
+      timeout: 2000,
+      transports: ["websocket"]
+    });
+    let sessions = 0;
+    let roomStates = 0;
+    staleSocket.on("session", () => {
+      sessions += 1;
+    });
+    staleSocket.on("room:state", () => {
+      roomStates += 1;
+    });
     await assert.rejects(
-      () => connectPlayer(server.port, user.token, 2),
+      () => connectPreparedSocket(staleSocket),
       (error: Error & { data?: Json }) => {
         assert.equal(error.data?.code, "CLIENT_UPGRADE_REQUIRED");
         assert.equal(error.data?.minimumBuild, 3);
@@ -234,6 +256,42 @@ test("upgrade and health endpoints expose version state without requiring a clie
         assert.equal(error.data?.latestVersion, "1.0.2");
         assert.equal(error.data?.downloadUrl, "https://example.invalid/git-okami.apk");
         assert.equal(typeof error.data?.requestId, "string");
+        return true;
+      }
+    );
+    assert.equal(staleSocket.connected, false);
+    assert.equal(sessions, 0);
+    assert.equal(roomStates, 0);
+    staleSocket.disconnect();
+  } finally {
+    await server.close();
+  }
+});
+
+test("explicit minimum client build can require a future app build", async () => {
+  const server = await startServer({ MIN_CLIENT_BUILD: "4" });
+  try {
+    const version = await request(server.port, "GET", "/client-version");
+    assert.equal(version.status, 200);
+    assert.equal(version.body.minimumBuild, 4);
+
+    const blocked = await request(server.port, "POST", "/auth/guest", {}, "3");
+    assert.equal(blocked.status, 426);
+    assert.equal(blocked.body.code, "CLIENT_UPGRADE_REQUIRED");
+    assert.equal(blocked.body.minimumBuild, 4);
+    assert.equal(blocked.body.currentBuild, 3);
+
+    const user = await register(server.port, "future_socket", "4");
+    const okSocket = await connectPlayer(server.port, user.token, 4);
+    assert.equal(okSocket.connected, true);
+    okSocket.disconnect();
+
+    await assert.rejects(
+      () => connectPlayer(server.port, user.token, 3),
+      (error: Error & { data?: Json }) => {
+        assert.equal(error.data?.code, "CLIENT_UPGRADE_REQUIRED");
+        assert.equal(error.data?.minimumBuild, 4);
+        assert.equal(error.data?.currentBuild, 3);
         return true;
       }
     );
@@ -624,8 +682,8 @@ async function startHeadsUpRoom(alpha: ClientSocket, beta: ClientSocket, rules: 
   return started.state;
 }
 
-async function register(port: number, username: string): Promise<Json> {
-  const response = await request(port, "POST", "/auth/register", { username, password: "secret1", nickname: username }, "3");
+async function register(port: number, username: string, clientBuild = "3"): Promise<Json> {
+  const response = await request(port, "POST", "/auth/register", { username, password: "secret1", nickname: username }, clientBuild);
   assert.equal(response.status, 200);
   return response.body;
 }

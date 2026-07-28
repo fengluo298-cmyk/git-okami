@@ -10,10 +10,11 @@ import { parseChipAmount } from "./amount.js";
 import { OperationDeduper, RoomActionQueue, type AckResult } from "./operations.js";
 import { SocketPresence } from "./socketPresence.js";
 import { createRateLimiter } from "./rateLimiter.js";
+import { chooseCorsOrigin, readCorsOrigins } from "./cors.js";
 
 const port = Number(process.env.PORT ?? 4000);
-const corsOrigin = readCorsOrigin("CORS_ORIGIN");
-const socketCorsOrigin = process.env.SOCKET_CORS_ORIGIN ?? corsOrigin;
+const corsOrigins = readCorsOrigins("CORS_ORIGIN");
+const socketCorsOrigins = process.env.SOCKET_CORS_ORIGIN === undefined ? corsOrigins : readCorsOrigins("SOCKET_CORS_ORIGIN");
 const minClientBuild = readMinimumClientBuild();
 const latestClientVersion = process.env.LATEST_CLIENT_VERSION ?? "1.0.2";
 const clientDownloadUrl = process.env.CLIENT_DOWNLOAD_URL?.trim() || null;
@@ -97,7 +98,7 @@ const httpServer = createServer(async (req, res) => {
 });
 
 const io = new Server(httpServer, {
-  cors: { origin: socketCorsOrigin },
+  cors: { origin: socketCorsOrigins },
   connectionStateRecovery: {
     maxDisconnectionDuration: 120_000
   }
@@ -454,7 +455,7 @@ function sendError(res: ServerResponse, requestId: string, error: PublicError): 
 
 function setCors(req: IncomingMessage, res: ServerResponse): void {
   const origin = req.headers.origin;
-  const allowed = chooseCorsOrigin(origin);
+  const allowed = chooseCorsOrigin(corsOrigins, origin);
   if (allowed) res.setHeader("access-control-allow-origin", allowed);
   res.setHeader("access-control-allow-methods", "GET,POST,OPTIONS");
   res.setHeader("access-control-allow-headers", "content-type,authorization,x-client-build");
@@ -591,21 +592,6 @@ function withRoomLock<T>(roomId: string | undefined, enabled: boolean | undefine
   if (!enabled) return work();
   if (!roomId) return work();
   return roomLocks.run(roomId, work);
-}
-
-function chooseCorsOrigin(origin: string | undefined): string | null {
-  if (corsOrigin === "*") return "*";
-  const allowed = corsOrigin.split(",").map((item) => item.trim()).filter(Boolean);
-  if (!origin) return allowed[0] ?? null;
-  return allowed.includes(origin) ? origin : null;
-}
-
-function readCorsOrigin(name: string): string {
-  const value = process.env[name] ?? (process.env.NODE_ENV === "production" ? "" : "*");
-  if (process.env.NODE_ENV === "production" && (!value || value.trim() === "*")) {
-    throw new Error(`${name} must be set to explicit trusted origins in production`);
-  }
-  return value;
 }
 
 function readTrustProxyHops(): number {

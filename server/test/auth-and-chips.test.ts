@@ -4,7 +4,7 @@ import { mkdtempSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { DatabaseSync } from "node:sqlite";
-import { ClientUpgradeRequiredError, guestLogin, register, login, verifyToken, isPasswordHash, parseClientBuild, readMinimumClientBuild, requireClientBuild } from "../src/auth.js";
+import { ClientUpgradeRequiredError, CURRENT_PROTOCOL_BUILD, guestLogin, register, login, verifyToken, isPasswordHash, parseClientBuild, readMinimumClientBuild, requireClientBuild } from "../src/auth.js";
 import { AppDatabase, databaseFile } from "../src/db.js";
 import { RoomStore, type Room } from "../src/roomStore.js";
 
@@ -35,31 +35,37 @@ test("guest login creates a token-backed virtual chip user", () => {
 test("client build gate rejects old app versions", () => {
   const originalNodeEnv = process.env.NODE_ENV;
   const originalMinBuild = process.env.MIN_CLIENT_BUILD;
-  assert.throws(() => requireClientBuild(undefined, 2), ClientUpgradeRequiredError);
-  assert.throws(() => requireClientBuild(1, 2), ClientUpgradeRequiredError);
-  assert.throws(() => requireClientBuild("abc", 3), ClientUpgradeRequiredError);
-  assert.throws(() => requireClientBuild(Number.NaN, 3), ClientUpgradeRequiredError);
-  assert.throws(() => requireClientBuild(Number.POSITIVE_INFINITY, 3), ClientUpgradeRequiredError);
-  assert.throws(() => requireClientBuild("2.5", 3), ClientUpgradeRequiredError);
-  assert.doesNotThrow(() => requireClientBuild("2", 2));
-  assert.throws(() => requireClientBuild(2, 3), /Client version/);
-  assert.doesNotThrow(() => requireClientBuild(3, 3));
-  assert.doesNotThrow(() => requireClientBuild(4, 3));
-  assert.equal(parseClientBuild(""), null);
-  assert.equal(parseClientBuild("-1"), null);
-  assert.equal(readMinimumClientBuild("3"), 3);
-  assert.throws(() => readMinimumClientBuild("bad"), /MIN_CLIENT_BUILD/);
   try {
     process.env.NODE_ENV = "development";
     delete process.env.MIN_CLIENT_BUILD;
-    assert.equal(readMinimumClientBuild(), 2);
+    assert.equal(readMinimumClientBuild(), CURRENT_PROTOCOL_BUILD);
 
     process.env.NODE_ENV = "production";
     delete process.env.MIN_CLIENT_BUILD;
-    assert.throws(() => readMinimumClientBuild(), /MIN_CLIENT_BUILD/);
+    assert.equal(readMinimumClientBuild(), CURRENT_PROTOCOL_BUILD);
   } finally {
     restoreEnv("NODE_ENV", originalNodeEnv);
     restoreEnv("MIN_CLIENT_BUILD", originalMinBuild);
+  }
+
+  assert.throws(() => requireClientBuild(undefined, 3), ClientUpgradeRequiredError);
+  assert.throws(() => requireClientBuild(2, 3), /Client version/);
+  assert.doesNotThrow(() => requireClientBuild(3, 3));
+  assert.doesNotThrow(() => requireClientBuild(4, 3));
+  assert.throws(() => requireClientBuild(3, 4), ClientUpgradeRequiredError);
+  assert.doesNotThrow(() => requireClientBuild(4, 4));
+
+  assert.equal(parseClientBuild(""), null);
+  assert.equal(parseClientBuild("0"), null);
+  assert.equal(parseClientBuild("-1"), null);
+  assert.equal(parseClientBuild("2.5"), null);
+  assert.equal(parseClientBuild(Number.NaN), null);
+  assert.equal(parseClientBuild(Number.POSITIVE_INFINITY), null);
+  assert.equal(parseClientBuild(String(Number.MAX_SAFE_INTEGER + 1)), null);
+  assert.equal(readMinimumClientBuild("3"), 3);
+  assert.equal(readMinimumClientBuild("4"), 4);
+  for (const value of ["", "   ", "abc", "NaN", "Infinity", "2.5", "0", "-1", String(Number.MAX_SAFE_INTEGER + 1)]) {
+    assert.throws(() => readMinimumClientBuild(value), /MIN_CLIENT_BUILD/);
   }
 });
 

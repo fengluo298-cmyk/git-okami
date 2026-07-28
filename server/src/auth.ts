@@ -7,7 +7,7 @@ const JWT_SECRET = readJwtSecret();
 const VOICE_SECRET = process.env.VOICE_APP_SECRET || JWT_SECRET;
 const TOKEN_TTL_SECONDS = 60 * 60 * 24 * 30;
 const MAX_PASSWORD_LENGTH = 128;
-const DEFAULT_MIN_CLIENT_BUILD = 2;
+export const CURRENT_PROTOCOL_BUILD = 3;
 
 export type AuthSession = {
   token: string;
@@ -72,17 +72,18 @@ export class ClientUpgradeRequiredError extends Error {
   }
 }
 
-export function readMinimumClientBuild(value: unknown = process.env.MIN_CLIENT_BUILD ?? (process.env.NODE_ENV === "production" ? undefined : DEFAULT_MIN_CLIENT_BUILD)): number {
+export function readMinimumClientBuild(value: unknown = process.env.MIN_CLIENT_BUILD): number {
+  if (value === undefined) return CURRENT_PROTOCOL_BUILD;
   const build = parseClientBuild(value);
-  if (build === null) throw new Error("MIN_CLIENT_BUILD must be a safe non-negative integer");
+  if (build === null) throw new Error("MIN_CLIENT_BUILD must be a safe positive integer");
   return build;
 }
 
 export function parseClientBuild(value: unknown): number | null {
-  if (typeof value === "number") return Number.isSafeInteger(value) && value >= 0 ? value : null;
+  if (typeof value === "number") return Number.isSafeInteger(value) && value >= 1 ? value : null;
   if (typeof value !== "string") return null;
   const text = value.trim();
-  if (!/^(0|[1-9]\d*)$/.test(text)) return null;
+  if (!/^[1-9]\d*$/.test(text)) return null;
   const build = Number(text);
   return Number.isSafeInteger(build) ? build : null;
 }
