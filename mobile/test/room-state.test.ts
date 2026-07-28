@@ -31,11 +31,27 @@ test("authoritative room state uses room epoch hand id and source before accepti
   assert.equal(acceptAuthoritativeRoomState(current, room({ id: "other", stateVersion: 8 }), "room:state").accepted, false);
 });
 
-test("authoritative room state accepts null only from leave", () => {
-  const current = room({ stateVersion: 2 });
+test("authoritative room state accepts null only from leave, resume, or matching room null broadcast", () => {
+  const current = room({ roomEpoch: "epoch-a", stateVersion: 2 });
   const lateNull = acceptAuthoritativeRoomState(current, null, "room:state");
   assert.equal(lateNull.accepted, false);
   assert.equal(lateNull.room, current);
+
+  const matchingBroadcast = acceptAuthoritativeRoomState(current, null, "room:state", { nullRoomId: current.id, nullRoomEpoch: "epoch-a" });
+  assert.equal(matchingBroadcast.accepted, true);
+  assert.equal(matchingBroadcast.room, null);
+
+  const oldRoomBroadcast = acceptAuthoritativeRoomState(current, null, "room:state", { nullRoomId: "old-room", nullRoomEpoch: "epoch-a" });
+  assert.equal(oldRoomBroadcast.accepted, false);
+  assert.equal(oldRoomBroadcast.room, current);
+
+  const oldEpochBroadcast = acceptAuthoritativeRoomState(current, null, "room:state", { nullRoomId: current.id, nullRoomEpoch: "old-epoch" });
+  assert.equal(oldEpochBroadcast.accepted, false);
+  assert.equal(oldEpochBroadcast.room, current);
+
+  const resumeNull = acceptAuthoritativeRoomState(current, null, "resume", { resumeInFlight: true });
+  assert.equal(resumeNull.accepted, true);
+  assert.equal(resumeNull.room, null);
 
   const leave = acceptAuthoritativeRoomState(current, null, "leave");
   assert.equal(leave.accepted, true);

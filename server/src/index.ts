@@ -123,10 +123,23 @@ io.on("connection", (socket: Socket) => {
   userSockets.add(userId, socket.id);
   socket.emit("session", currentSocketUser(socket));
   socket.emit("rooms:list", rooms.listRooms());
-  void resumeRoom(socket).catch((error) => logSocketTaskError("rooms:resume", error));
 
   socket.on("rooms:list", () => socket.emit("rooms:list", rooms.listRooms()));
-  socket.on("rooms:resume", () => void resumeRoom(socket).catch((error) => logSocketTaskError("rooms:resume", error)));
+  socket.on("rooms:resume", (payloadOrAck?: { reason?: string } | Ack, ack?: Ack) => {
+    const callback = typeof payloadOrAck === "function" ? payloadOrAck : ack;
+    void resumeRoom(socket)
+      .then((result) => {
+        if (callback) callback(result);
+        else socket.emit("room:state", result.state);
+      })
+      .catch((error) => {
+        logSocketTaskError("rooms:resume", error);
+        const publicError = toPublicError(error);
+        const result = errorPayload(publicError, randomUUID());
+        if (callback) callback(result);
+        else socket.emit("error:message", { message: result.message, code: result.code, requestId: result.requestId });
+      });
+  });
 
   socket.on("rooms:create", (payload: { name?: string; rules?: Partial<RoomRules>; operationId?: string } = {}, ack?: Ack) =>
     handle("rooms:create", socket, ack, payload, () => {
@@ -152,7 +165,7 @@ io.on("connection", (socket: Socket) => {
     handle("rooms:leave", socket, ack, payload, () => {
       const room = rooms.leaveRoom(userId);
       if (room) leaveUserSockets(userId, room.id);
-      emitToUser(userId, "room:state", null);
+      emitToUser(userId, "room:state", null, room ? { reason: "leave", roomId: room.id, roomEpoch: room.roomEpoch } : { reason: "leave" });
       refreshUserSessions(userId);
       emitRooms();
       if (room) emitRoom(room);
@@ -314,25 +327,33 @@ function emitRooms(): void {
   io.emit("rooms:list", rooms.listRooms());
 }
 
-function emitRoom(room: Room): void {
+function emitRoom(room: Room, exceptSocketId?: string): void {
   for (const socket of io.sockets.sockets.values()) {
+    if (socket.id === exceptSocketId) continue;
     const user = socket.data.user as UserRecord | undefined;
     if (user && room.members.has(user.id)) socket.emit("room:state", rooms.publicRoom(room.id, user.id));
   }
 }
 
-async function resumeRoom(socket: Socket): Promise<void> {
+async function resumeRoom(socket: Socket): Promise<AckResult> {
   const userId = currentSocketUser(socket).id;
   const current = rooms.currentRoom(userId);
-  if (!current) return;
-  await roomLocks.run(current.id, () => {
+  if (!current) {
+    return { ok: true, code: "OK", state: null };
+  }
+  const result = await roomLocks.run(current.id, () => {
     const previousVersion = current.version;
     const room = rooms.markConnected(userId, true);
-    if (!room) return;
+    if (!room) return { ok: true, code: "OK", state: null };
     socket.join(room.id);
-    emitRoom(room);
-    if (room.version !== previousVersion) scheduleRoomTimer(room);
+    if (room.version !== previousVersion) {
+      emitRoom(room, socket.id);
+      scheduleRoomTimer(room);
+    }
+    const state = rooms.publicRoom(room.id, userId);
+    return { ok: true, code: "OK", stateVersion: state.stateVersion, state };
   });
+  return result;
 }
 
 async function markDisconnected(userId: string): Promise<void> {
@@ -389,8 +410,8 @@ function refreshUserSessions(userId: string): void {
   }
 }
 
-function emitToUser(userId: string, event: string, payload: unknown): void {
-  for (const socketId of userSockets.ids(userId)) io.sockets.sockets.get(socketId)?.emit(event, payload);
+function emitToUser(userId: string, event: string, payload: unknown, meta?: unknown): void {
+  for (const socketId of userSockets.ids(userId)) io.sockets.sockets.get(socketId)?.emit(event, payload, meta);
 }
 
 function joinUserSockets(userId: string, roomId: string): void {

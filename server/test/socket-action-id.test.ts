@@ -22,8 +22,16 @@ test("socket create join and leave retries are atomic across same-user sockets",
     sockets.push(alphaOne, alphaTwo, betaSocket);
     const alphaOneStates: Json[] = [];
     const alphaTwoStates: Json[] = [];
+    const alphaOneNullMetas: Json[] = [];
+    const alphaTwoNullMetas: Json[] = [];
     alphaOne.on("room:state", (state) => alphaOneStates.push(state));
     alphaTwo.on("room:state", (state) => alphaTwoStates.push(state));
+    alphaOne.on("room:state", (state, meta) => {
+      if (state === null) alphaOneNullMetas.push(meta);
+    });
+    alphaTwo.on("room:state", (state, meta) => {
+      if (state === null) alphaTwoNullMetas.push(meta);
+    });
 
     const actionId = unique("create_atomic");
     const [first, second] = await Promise.all([
@@ -47,6 +55,8 @@ test("socket create join and leave retries are atomic across same-user sockets",
     const leaveRetry = await emitAck(alphaTwo, "rooms:leave", { actionId: leave.actionId, stateVersion: latestAlpha.stateVersion });
     assert.deepEqual(leaveRetry, leave);
     await waitFor(() => alphaOneStates.at(-1) === null && alphaTwoStates.at(-1) === null);
+    assert.deepEqual(alphaOneNullMetas.at(-1), { reason: "leave", roomId: first.roomId, roomEpoch: first.state.roomEpoch });
+    assert.deepEqual(alphaTwoNullMetas.at(-1), { reason: "leave", roomId: first.roomId, roomEpoch: first.state.roomEpoch });
   } finally {
     for (const socket of sockets) socket.disconnect();
     await server.close();
@@ -261,6 +271,148 @@ test("auth rate limiter trusts forwarded addresses only with explicit proxy hops
   }
 });
 
+test("legacy socket room recovery without ack emits one state to the requesting socket", async () => {
+  const server = await startServer();
+  const sockets: ClientSocket[] = [];
+  try {
+    const alpha = await register(server.port, "alpha_legacy_resume");
+    const beta = await register(server.port, "beta_legacy_resume");
+    const alphaOld = await connectPlayer(server.port, alpha.token);
+    const betaSocket = await connectPlayer(server.port, beta.token);
+    sockets.push(alphaOld, betaSocket);
+
+    const created = await emitAck(alphaOld, "rooms:create", { actionId: unique("create") });
+    assert.equal(created.ok, true);
+    const joined = await emitAck(betaSocket, "rooms:join", { actionId: unique("join"), roomId: created.roomId });
+    assert.equal(joined.ok, true);
+    alphaOld.disconnect();
+    await delay(80);
+
+    const coldSocket = connectSocket(`http://127.0.0.1:${server.port}`, {
+      auth: { token: alpha.token, clientBuild: 3 },
+      autoConnect: false,
+      reconnection: false,
+      timeout: 2000,
+      transports: ["websocket"]
+    });
+    sockets.push(coldSocket);
+    const coldStates: Json[] = [];
+    const betaStates: Json[] = [];
+    coldSocket.on("room:state", (state) => coldStates.push(state));
+    betaSocket.on("room:state", (state) => betaStates.push(state));
+
+    await connectPreparedSocket(coldSocket);
+    await delay(100);
+    assert.equal(coldStates.length, 0);
+
+    coldSocket.emit("rooms:resume");
+    await waitFor(() => coldStates.length === 1);
+    await delay(100);
+    assert.equal(betaStates.length, 0);
+    assert.equal(coldStates[0].id, created.roomId);
+    assert.equal(coldStates[0].roomEpoch, joined.state.roomEpoch);
+    assert.equal(coldStates[0].handId, joined.state.handId);
+    assert.equal(coldStates[0].stateVersion, joined.stateVersion);
+  } finally {
+    for (const socket of sockets) socket.disconnect();
+    await server.close();
+  }
+});
+
+test("legacy socket room recovery without a room emits one null state", async () => {
+  const server = await startServer();
+  const sockets: ClientSocket[] = [];
+  try {
+    const alpha = await register(server.port, "alpha_legacy_no_room");
+    const alphaSocket = await connectPlayer(server.port, alpha.token);
+    sockets.push(alphaSocket);
+    const states: Json[] = [];
+    alphaSocket.on("room:state", (state) => states.push(state));
+
+    await delay(100);
+    assert.equal(states.length, 0);
+    alphaSocket.emit("rooms:resume");
+    await waitFor(() => states.length === 1);
+    await delay(100);
+    assert.equal(states.length, 1);
+    assert.equal(states[0], null);
+  } finally {
+    for (const socket of sockets) socket.disconnect();
+    await server.close();
+  }
+});
+
+test("socket room recovery is explicit and returns one ack snapshot", async () => {
+  const server = await startServer();
+  const sockets: ClientSocket[] = [];
+  try {
+    const alpha = await register(server.port, "alpha_explicit_resume");
+    const alphaSocket = await connectPlayer(server.port, alpha.token);
+    sockets.push(alphaSocket);
+
+    const created = await emitAck(alphaSocket, "rooms:create", { actionId: unique("create") });
+    assert.equal(created.ok, true);
+    const sat = await emitAck(alphaSocket, "seat:sit", { actionId: unique("sit"), seat: 0, buyIn: 1000, stateVersion: created.stateVersion });
+    assert.equal(sat.ok, true);
+    alphaSocket.disconnect();
+    await delay(100);
+
+    const coldSocket = connectSocket(`http://127.0.0.1:${server.port}`, {
+      auth: { token: alpha.token, clientBuild: 3 },
+      autoConnect: false,
+      reconnection: false,
+      timeout: 2000,
+      transports: ["websocket"]
+    });
+    sockets.push(coldSocket);
+    const unsolicitedStates: Json[] = [];
+    coldSocket.on("room:state", (state) => unsolicitedStates.push(state));
+    await connectPreparedSocket(coldSocket);
+    await delay(100);
+    assert.equal(unsolicitedStates.length, 0);
+
+    let ackCount = 0;
+    const resume = await new Promise<Json>((resolve, reject) => {
+      coldSocket.timeout(2000).emit("rooms:resume", { reason: "socket-connect" }, (error: Error | null, result?: Json) => {
+        ackCount += 1;
+        if (error) reject(error);
+        else resolve(result ?? {});
+      });
+    });
+    assert.equal(resume.ok, true);
+    assert.equal(ackCount, 1);
+    assert.equal(resume.state.id, created.roomId);
+    assert.equal(resume.stateVersion, resume.state.stateVersion);
+    assert.equal(seat(resume.state, alpha.user.id)?.connected, true);
+    await delay(100);
+    assert.equal(unsolicitedStates.length, 0);
+  } finally {
+    for (const socket of sockets) socket.disconnect();
+    await server.close();
+  }
+});
+
+test("socket room recovery returns null when the authenticated user has no room", async () => {
+  const server = await startServer();
+  const sockets: ClientSocket[] = [];
+  try {
+    const alpha = await register(server.port, "alpha_resume_no_room");
+    const alphaSocket = await connectPlayer(server.port, alpha.token);
+    sockets.push(alphaSocket);
+    const states: Json[] = [];
+    alphaSocket.on("room:state", (state) => states.push(state));
+
+    const resume = await emitAck(alphaSocket, "rooms:resume", { reason: "socket-connect" });
+    assert.equal(resume.ok, true);
+    assert.equal(resume.state, null);
+    await delay(100);
+    assert.equal(states.length, 0);
+  } finally {
+    for (const socket of sockets) socket.disconnect();
+    await server.close();
+  }
+});
+
 test("same user reconnect keeps the new socket online when the old socket disconnects", async () => {
   const server = await startServer();
   const sockets: ClientSocket[] = [];
@@ -370,6 +522,8 @@ test("non-current player reconnect does not orphan or duplicate the action timer
     await waitFor(() => latestAlpha !== null && seat(latestAlpha, beta.user.id)?.connected === false);
     betaSocket = await connectPlayer(server.port, beta.token);
     sockets.push(betaSocket);
+    const resume = await emitAck(betaSocket, "rooms:resume", { reason: "socket-connect" });
+    assert.equal(resume.ok, true);
     await waitFor(() => latestAlpha !== null && seat(latestAlpha, beta.user.id)?.connected === true);
 
     const versionAfterReconnect = latestAlpha!.stateVersion;
@@ -440,6 +594,9 @@ test("two socket clients keep public state synchronized through a hand and recon
     betaSocket.on("room:state", (state) => {
       if (state) latest.beta = state;
     });
+    const betaResume = await emitAck(betaSocket, "rooms:resume", { reason: "socket-connect" });
+    assert.equal(betaResume.ok, true);
+    latest.beta = betaResume.state;
     await waitFor(() => latest.beta !== null && latest.beta.stateVersion >= latest.alpha!.stateVersion && seat(latest.beta, beta.user.id)?.connected === true);
     assertPublicFieldsMatch(latest.alpha!, latest.beta!);
   } finally {
@@ -506,6 +663,25 @@ async function connectPlayer(port: number, token: string, clientBuild = 3): Prom
       clearTimeout(timer);
       reject(error);
     });
+  });
+}
+
+async function connectPreparedSocket(socket: ClientSocket): Promise<void> {
+  if (socket.connected) return;
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      socket.disconnect();
+      reject(new Error("socket connect timeout"));
+    }, 3000);
+    socket.once("connect", () => {
+      clearTimeout(timer);
+      resolve();
+    });
+    socket.once("connect_error", (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+    socket.connect();
   });
 }
 

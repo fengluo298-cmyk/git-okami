@@ -99,6 +99,8 @@ type UpgradeInfo = {
   downloadUrl: string | null;
   requestId: string | null;
 };
+type ResumeAck = { ok?: boolean; code?: string; error?: string; message?: string; state?: unknown; stateVersion?: number };
+type RoomStateMeta = { reason?: unknown; roomId?: unknown; roomEpoch?: unknown };
 
 const clientBuild = 3;
 const productionServerUrl = "https://git-okami.onrender.com";
@@ -191,9 +193,11 @@ export default function App() {
     setRoom(nextRoom);
   }
 
-  function applyAuthoritativeRoomState(incoming: RoomState | null, source: RoomStateSource): boolean {
+  function applyAuthoritativeRoomState(incoming: RoomState | null, source: RoomStateSource, meta?: RoomStateMeta): boolean {
     const decision = acceptAuthoritativeRoomState(roomRef.current, incoming, source, {
-      resumeInFlight: resumeInFlightRef.current || pendingResumeRef.current || source === "resume"
+      resumeInFlight: resumeInFlightRef.current || pendingResumeRef.current || source === "resume",
+      nullRoomId: typeof meta?.roomId === "string" ? meta.roomId : undefined,
+      nullRoomEpoch: typeof meta?.roomEpoch === "string" ? meta.roomEpoch : undefined
     });
     if (!decision.accepted) {
       logRoomProtocol("reject", source, decision.reason, incoming);
@@ -236,7 +240,25 @@ export default function App() {
       resumeInFlightRef.current = false;
       if (pendingResumeRef.current && mountedRef.current) requestRoomResume("manual-retry");
     }, 8000);
-    currentSocket.emit("rooms:resume", { reason, roomId: currentRoom?.id, stateVersion: currentRoom?.stateVersion });
+    currentSocket.timeout(6000).emit("rooms:resume", { reason, roomId: currentRoom?.id, stateVersion: currentRoom?.stateVersion }, (error: Error | null, result?: ResumeAck) => {
+      if (!mountedRef.current) return;
+      if (error) {
+        resumeInFlightRef.current = false;
+        logResume("timeout", reason, roomRef.current);
+        if (pendingResumeRef.current) requestRoomResume("manual-retry");
+        return;
+      }
+      if (!result?.ok) {
+        clearResumeRequest();
+        showError(result?.message ?? result?.error ?? "房间恢复失败");
+        return;
+      }
+      if (Object.prototype.hasOwnProperty.call(result, "state")) {
+        if (!applyAuthoritativeRoomState(readAckRoomState(result.state), "resume")) clearResumeRequest();
+        return;
+      }
+      clearResumeRequest();
+    });
     logResume("sent", reason, currentRoom);
     return true;
   }
@@ -352,6 +374,7 @@ export default function App() {
     const next = io(url, {
       transports: ["websocket"],
       auth: { token: nextToken, clientBuild },
+      autoConnect: false,
       reconnection: true,
       reconnectionAttempts: Infinity,
       reconnectionDelay: 500,
@@ -362,10 +385,11 @@ export default function App() {
       setStatus("online");
       setLastError("");
       setAuthState("authenticated");
+      requestRoomResume("socket-connect");
     });
     next.on("session", setUser);
     next.on("rooms:list", setRooms);
-    next.on("room:state", (nextRoom: RoomState | null) => applyAuthoritativeRoomState(nextRoom, "room:state"));
+    next.on("room:state", (nextRoom: RoomState | null, meta?: RoomStateMeta) => applyAuthoritativeRoomState(nextRoom, "room:state", meta));
     next.on("error:message", ({ message }: { message: string }) => showError(message));
     next.on("disconnect", (reason) => {
       setStatus(next.active ? "reconnecting" : "offline");
@@ -380,6 +404,7 @@ export default function App() {
     });
     socketRef.current = next;
     setSocket(next);
+    next.connect();
   }
 
   async function refreshUpgradeStatus() {

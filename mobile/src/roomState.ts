@@ -19,6 +19,12 @@ export type RoomStateDecision<T> = {
   needsResume?: boolean;
 };
 
+export type RoomStateOptions = {
+  resumeInFlight?: boolean;
+  nullRoomId?: string;
+  nullRoomEpoch?: string;
+};
+
 export type PendingSocketAction = {
   event: string;
   payload: Record<string, unknown>;
@@ -52,10 +58,19 @@ export function acceptAuthoritativeRoomState<T extends AuthoritativeRoomState>(
   current: T | null,
   incoming: T | null,
   source: RoomStateSource,
-  options: { resumeInFlight?: boolean } = {}
+  options: RoomStateOptions = {}
 ): RoomStateDecision<T> {
   if (incoming === null) {
-    return source === "leave" ? { accepted: true, room: null } : { accepted: false, room: current, reason: "late-null-state" };
+    if (source === "leave" || source === "resume") return { accepted: true, room: null };
+    if (
+      source === "room:state" &&
+      current &&
+      options.nullRoomId === current.id &&
+      (!options.nullRoomEpoch || !current.roomEpoch || options.nullRoomEpoch === current.roomEpoch)
+    ) {
+      return { accepted: true, room: null };
+    }
+    return { accepted: false, room: current, reason: "late-null-state" };
   }
   if (!isValidRoomState(incoming)) return { accepted: false, room: current, reason: "invalid-room-state" };
 
