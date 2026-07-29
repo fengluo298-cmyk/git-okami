@@ -1,6 +1,17 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { acceptAuthoritativeRoomState, clearPendingSocketAction, prepareSocketAction, type AuthoritativeRoomState, type PendingSocketAction } from "../src/roomState";
+import {
+  acceptAuthoritativeRoomState,
+  clearPendingSocketAction,
+  consumeRoomEntryContext,
+  createRoomEntryContext,
+  isRoomEntryContextActive,
+  prepareSocketAction,
+  type AuthoritativeRoomState,
+  type PendingSocketAction,
+  type RoomEntryContext,
+  type RoomEntryEvent
+} from "../src/roomState";
 
 test("authoritative room state rejects stale duplicate and conflicting updates", () => {
   const current = room({ stateVersion: 5, handId: 1, board: [] });
@@ -113,6 +124,133 @@ test("authoritative room state rejects stale epochs and late states after leavin
   assert.equal(randomAck.reason, "late-room-state");
 });
 
+test("ordinary room broadcasts remain rejected without create or join pending entry", () => {
+  const incoming = room({ stateVersion: 1 });
+  const unexpected = acceptAuthoritativeRoomState(null, incoming, "room:state");
+  assert.equal(unexpected.accepted, false);
+  assert.equal(unexpected.reason, "late-room-state");
+});
+
+test("create and join broadcast-before-ack snapshots enter only with active pending context", () => {
+  for (const event of ["rooms:create", "rooms:join"] as const) {
+    const context = roomEntryContext(event);
+    const incoming = room({ stateVersion: 1 });
+
+    const pendingEntry = acceptAuthoritativeRoomState(null, incoming, "room:state", {
+      roomEntryInFlight: isRoomEntryContextActive(context, 1, 1)
+    });
+
+    assert.equal(pendingEntry.accepted, true);
+    assert.equal(pendingEntry.room, incoming);
+    assert.equal(consumeRoomEntryContext(context, 1, 1), true);
+    assert.equal(isRoomEntryContextActive(context, 1, 1), false);
+  }
+});
+
+test("pending room entry permission is consumed once before room id rules resume", () => {
+  const context = roomEntryContext("rooms:create");
+  const firstRoom = room({ id: "room-1", stateVersion: 1 });
+  const secondRoom = room({ id: "room-2", roomEpoch: "epoch-b", stateVersion: 1 });
+
+  const accepted = acceptAuthoritativeRoomState(null, firstRoom, "room:state", {
+    roomEntryInFlight: isRoomEntryContextActive(context, 1, 1)
+  });
+  assert.equal(accepted.accepted, true);
+  assert.equal(consumeRoomEntryContext(context, 1, 1), true);
+
+  const rejected = acceptAuthoritativeRoomState(accepted.room, secondRoom, "room:state", {
+    roomEntryInFlight: isRoomEntryContextActive(context, 1, 1)
+  });
+  assert.equal(rejected.accepted, false);
+  assert.equal(rejected.reason, "room-id-mismatch");
+  assert.equal(rejected.room, firstRoom);
+});
+
+test("create and join ack failure clear pending room entry before late state arrives", () => {
+  for (const event of ["rooms:create", "rooms:join"] as const) {
+    let context: RoomEntryContext | null = roomEntryContext(event);
+    context = null;
+
+    const lateState = acceptAuthoritativeRoomState(null, room({ stateVersion: 1 }), "room:state", {
+      roomEntryInFlight: isRoomEntryContextActive(context, 1, 1)
+    });
+    assert.equal(lateState.accepted, false);
+    assert.equal(lateState.reason, "late-room-state");
+  }
+});
+
+test("create and join timeout clear pending room entry before late state arrives", () => {
+  for (const event of ["rooms:create", "rooms:join"] as const) {
+    let context: RoomEntryContext | null = roomEntryContext(event);
+    context = null;
+
+    const lateState = acceptAuthoritativeRoomState(null, room({ stateVersion: 1 }), "room:state", {
+      roomEntryInFlight: isRoomEntryContextActive(context, 1, 1)
+    });
+    assert.equal(lateState.accepted, false);
+    assert.equal(lateState.reason, "late-room-state");
+  }
+});
+
+test("stale session or socket rejects pending room entry snapshots", () => {
+  const sessionContext = roomEntryContext("rooms:create", "action-session", 1, 1);
+  const staleSession = acceptAuthoritativeRoomState(null, room({ stateVersion: 1 }), "room:state", {
+    roomEntryInFlight: isRoomEntryContextActive(sessionContext, 2, 1)
+  });
+  assert.equal(staleSession.accepted, false);
+  assert.equal(staleSession.reason, "late-room-state");
+
+  const socketContext = roomEntryContext("rooms:join", "action-socket", 1, 1);
+  const staleSocket = acceptAuthoritativeRoomState(null, room({ stateVersion: 1 }), "room:state", {
+    roomEntryInFlight: isRoomEntryContextActive(socketContext, 1, 2)
+  });
+  assert.equal(staleSocket.accepted, false);
+  assert.equal(staleSocket.reason, "late-room-state");
+});
+
+test("pending room entry never accepts null room state", () => {
+  const context = roomEntryContext("rooms:create");
+  const lateNull = acceptAuthoritativeRoomState(null, null, "room:state", {
+    roomEntryInFlight: isRoomEntryContextActive(context, 1, 1)
+  });
+  assert.equal(lateNull.accepted, false);
+  assert.equal(lateNull.reason, "late-null-state");
+});
+
+test("explicit resume still restores from null without room entry pending", () => {
+  const incoming = room({ stateVersion: 1 });
+  const resumed = acceptAuthoritativeRoomState(null, incoming, "resume", { resumeInFlight: true });
+  assert.equal(resumed.accepted, true);
+  assert.equal(resumed.room, incoming);
+});
+
+test("leave metadata still clears only the matching current room", () => {
+  const current = room({ id: "room-1", roomEpoch: "epoch-a", stateVersion: 4 });
+
+  const matchingLeave = acceptAuthoritativeRoomState(current, null, "room:state", {
+    nullRoomId: "room-1",
+    nullRoomEpoch: "epoch-a"
+  });
+  assert.equal(matchingLeave.accepted, true);
+  assert.equal(matchingLeave.room, null);
+
+  const oldRoomLeave = acceptAuthoritativeRoomState(current, null, "room:state", {
+    nullRoomId: "old-room",
+    nullRoomEpoch: "epoch-a"
+  });
+  assert.equal(oldRoomLeave.accepted, false);
+  assert.equal(oldRoomLeave.reason, "late-null-state");
+  assert.equal(oldRoomLeave.room, current);
+
+  const oldEpochLeave = acceptAuthoritativeRoomState(current, null, "room:state", {
+    nullRoomId: "room-1",
+    nullRoomEpoch: "old-epoch"
+  });
+  assert.equal(oldEpochLeave.accepted, false);
+  assert.equal(oldEpochLeave.reason, "late-null-state");
+  assert.equal(oldEpochLeave.room, current);
+});
+
 test("same version comparison ignores transport-only differences and detects business conflicts", () => {
   const current = room({ stateVersion: 9, serverTime: 1000 });
   const reordered = room({ stateVersion: 9, serverTime: 2000, rules: { maxPlayers: 6, bigBlind: 20, smallBlind: 10 } });
@@ -205,6 +343,12 @@ test("socket action retry keeps the original action fingerprint until an ack arr
 function assertDuplicate(decision: ReturnType<typeof acceptAuthoritativeRoomState>): void {
   assert.equal(decision.accepted, true);
   assert.equal(decision.duplicate, true);
+}
+
+function roomEntryContext(event: RoomEntryEvent, actionId = "action-1", sessionGeneration = 1, socketGeneration = 1): RoomEntryContext {
+  const context = createRoomEntryContext({ event, payload: { actionId } }, sessionGeneration, socketGeneration);
+  assert.ok(context);
+  return context;
 }
 
 function room(

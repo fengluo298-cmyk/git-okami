@@ -21,6 +21,7 @@ export type RoomStateDecision<T> = {
 
 export type RoomStateOptions = {
   resumeInFlight?: boolean;
+  roomEntryInFlight?: boolean;
   nullRoomId?: string;
   nullRoomEpoch?: string;
 };
@@ -28,6 +29,16 @@ export type RoomStateOptions = {
 export type PendingSocketAction = {
   event: string;
   payload: Record<string, unknown>;
+};
+
+export type RoomEntryEvent = "rooms:create" | "rooms:join";
+
+export type RoomEntryContext = {
+  event: RoomEntryEvent;
+  actionId: string;
+  sessionGeneration: number;
+  socketGeneration: number;
+  consumed: boolean;
 };
 
 export function prepareSocketAction(
@@ -52,6 +63,26 @@ export function prepareSocketAction(
 
 export function clearPendingSocketAction(pending: Record<string, PendingSocketAction>, key: string): void {
   delete pending[key];
+}
+
+export function createRoomEntryContext(action: PendingSocketAction, sessionGeneration: number, socketGeneration: number): RoomEntryContext | null {
+  const actionId = typeof action.payload.actionId === "string" ? action.payload.actionId : null;
+  if (!isRoomEntryEvent(action.event) || !actionId) return null;
+  return { event: action.event, actionId, sessionGeneration, socketGeneration, consumed: false };
+}
+
+export function isRoomEntryEvent(event: string): event is RoomEntryEvent {
+  return event === "rooms:create" || event === "rooms:join";
+}
+
+export function isRoomEntryContextActive(context: RoomEntryContext | null, sessionGeneration: number, socketGeneration: number): context is RoomEntryContext {
+  return Boolean(context && !context.consumed && context.sessionGeneration === sessionGeneration && context.socketGeneration === socketGeneration);
+}
+
+export function consumeRoomEntryContext(context: RoomEntryContext, sessionGeneration: number, socketGeneration: number): boolean {
+  if (!isRoomEntryContextActive(context, sessionGeneration, socketGeneration)) return false;
+  context.consumed = true;
+  return true;
 }
 
 export function acceptAuthoritativeRoomState<T extends AuthoritativeRoomState>(
@@ -109,8 +140,8 @@ function isValidRoomState(room: AuthoritativeRoomState): boolean {
   return typeof room.id === "string" && room.id.length > 0 && Number.isSafeInteger(room.stateVersion);
 }
 
-function canEnterRoom(source: RoomStateSource, options: { resumeInFlight?: boolean }): boolean {
-  return source === "create" || source === "join" || source === "resume" || (source === "room:state" && options.resumeInFlight === true);
+function canEnterRoom(source: RoomStateSource, options: { resumeInFlight?: boolean; roomEntryInFlight?: boolean }): boolean {
+  return source === "create" || source === "join" || source === "resume" || (source === "room:state" && (options.resumeInFlight === true || options.roomEntryInFlight === true));
 }
 
 function canReplaceRoom(source: RoomStateSource): boolean {

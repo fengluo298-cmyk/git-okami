@@ -18,7 +18,18 @@ import { apiRequest, AuthExpiredError, InvalidResponseError, NetworkError, Serve
 import { tokenStorage } from "./src/auth/tokenStorage";
 import { CardView } from "./src/components/CardView";
 import { ProgressBar } from "./src/components/ProgressBar";
-import { acceptAuthoritativeRoomState, clearPendingSocketAction, prepareSocketAction, type PendingSocketAction, type RoomStateSource } from "./src/roomState";
+import {
+  acceptAuthoritativeRoomState,
+  clearPendingSocketAction,
+  consumeRoomEntryContext,
+  createRoomEntryContext,
+  isRoomEntryContextActive,
+  isRoomEntryEvent,
+  prepareSocketAction,
+  type PendingSocketAction,
+  type RoomEntryContext,
+  type RoomStateSource
+} from "./src/roomState";
 import { ErrorLimiter } from "./src/utils/errorLimiter";
 import type { Card } from "./src/utils/cards";
 import { parseChipAmountInRange } from "./src/utils/amount";
@@ -114,6 +125,11 @@ export default function App() {
   const mountedRef = useRef(true);
   const socketRef = useRef<Socket | null>(null);
   const roomRef = useRef<RoomState | null>(null);
+  const userRef = useRef<User | null>(null);
+  const tokenRef = useRef("");
+  const sessionGenerationRef = useRef(0);
+  const socketGenerationRef = useRef(0);
+  const pendingRoomEntryRef = useRef<RoomEntryContext | null>(null);
   const pendingResumeRef = useRef(false);
   const resumeInFlightRef = useRef(false);
   const resumeTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -164,6 +180,10 @@ export default function App() {
       });
     return () => {
       mountedRef.current = false;
+      sessionGenerationRef.current += 1;
+      socketGenerationRef.current += 1;
+      clearPendingRoomEntry();
+      pendingActions.current = {};
       clearResumeRequest();
       cleanupSocket(socketRef.current);
     };
@@ -194,16 +214,20 @@ export default function App() {
   }
 
   function applyAuthoritativeRoomState(incoming: RoomState | null, source: RoomStateSource, meta?: RoomStateMeta): boolean {
+    const currentRoom = roomRef.current;
+    const pendingEntry = activeRoomEntryContext(source, incoming, currentRoom);
     const decision = acceptAuthoritativeRoomState(roomRef.current, incoming, source, {
       resumeInFlight: resumeInFlightRef.current || pendingResumeRef.current || source === "resume",
       nullRoomId: typeof meta?.roomId === "string" ? meta.roomId : undefined,
-      nullRoomEpoch: typeof meta?.roomEpoch === "string" ? meta.roomEpoch : undefined
+      nullRoomEpoch: typeof meta?.roomEpoch === "string" ? meta.roomEpoch : undefined,
+      roomEntryInFlight: Boolean(pendingEntry)
     });
     if (!decision.accepted) {
       logRoomProtocol("reject", source, decision.reason, incoming);
       if (decision.needsResume) requestRoomResume("state-conflict");
       return false;
     }
+    if (pendingEntry && currentRoom === null && incoming !== null) consumeRoomEntryContext(pendingEntry, sessionGenerationRef.current, socketGenerationRef.current);
     roomRef.current = decision.room;
     if (!decision.duplicate) setRoom(decision.room);
     clearResumeRequest();
@@ -213,6 +237,8 @@ export default function App() {
   function requestRoomResume(reason: ResumeReason): boolean {
     const currentSocket = socketRef.current;
     const currentRoom = roomRef.current;
+    const resumeSessionGeneration = sessionGenerationRef.current;
+    const resumeSocketGeneration = socketGenerationRef.current;
     if (!currentSocket?.connected) {
       if (currentRoom) pendingResumeRef.current = true;
       logResume("pending", reason, currentRoom);
@@ -241,7 +267,7 @@ export default function App() {
       if (pendingResumeRef.current && mountedRef.current) requestRoomResume("manual-retry");
     }, 8000);
     currentSocket.timeout(6000).emit("rooms:resume", { reason, roomId: currentRoom?.id, stateVersion: currentRoom?.stateVersion }, (error: Error | null, result?: ResumeAck) => {
-      if (!mountedRef.current) return;
+      if (!mountedRef.current || !isCurrentSocket(currentSocket, resumeSocketGeneration) || resumeSessionGeneration !== sessionGenerationRef.current) return;
       if (error) {
         resumeInFlightRef.current = false;
         logResume("timeout", reason, roomRef.current);
@@ -338,7 +364,12 @@ export default function App() {
     const safeSocketUrl = validateSocketUrl(socketUrl);
     validateHttpBaseUrl(apiBase);
     await tokenStorage.set(nextToken);
+    sessionGenerationRef.current += 1;
+    clearPendingRoomEntry();
+    pendingActions.current = {};
     setUpgradeInfo(null);
+    tokenRef.current = nextToken;
+    userRef.current = nextUser;
     setToken(nextToken);
     setUser(nextUser);
     connectSocket(nextToken, safeSocketUrl);
@@ -347,6 +378,9 @@ export default function App() {
 
   async function logout() {
     setAuthState("logging-out");
+    sessionGenerationRef.current += 1;
+    socketGenerationRef.current += 1;
+    clearPendingRoomEntry();
     cleanupSocket(socketRef.current);
     socketRef.current = null;
     setSocket(null);
@@ -355,6 +389,8 @@ export default function App() {
     } catch (error) {
       setLastError(zhMessage(errorMessage(error)));
     } finally {
+      tokenRef.current = "";
+      userRef.current = null;
       setToken("");
       setUser(null);
       replaceRoomState(null);
@@ -369,6 +405,9 @@ export default function App() {
   }
 
   function connectSocket(nextToken = token, url = validateSocketUrl(socketUrl)) {
+    socketGenerationRef.current += 1;
+    const socketGeneration = socketGenerationRef.current;
+    clearPendingRoomEntry();
     cleanupSocket(socketRef.current);
     setStatus("connecting");
     const next = io(url, {
@@ -382,22 +421,44 @@ export default function App() {
       timeout: 8000
     });
     next.on("connect", () => {
+      if (!isCurrentSocket(next, socketGeneration)) return;
       setStatus("online");
       setLastError("");
       setAuthState("authenticated");
       requestRoomResume("socket-connect");
     });
-    next.on("session", setUser);
-    next.on("rooms:list", setRooms);
-    next.on("room:state", (nextRoom: RoomState | null, meta?: RoomStateMeta) => applyAuthoritativeRoomState(nextRoom, "room:state", meta));
-    next.on("error:message", ({ message }: { message: string }) => showError(message));
+    next.on("session", (nextUser: User) => {
+      if (!isCurrentSocket(next, socketGeneration)) return;
+      userRef.current = nextUser;
+      setUser(nextUser);
+    });
+    next.on("rooms:list", (nextRooms: RoomSummary[]) => {
+      if (!isCurrentSocket(next, socketGeneration)) return;
+      setRooms(nextRooms);
+    });
+    next.on("room:state", (nextRoom: RoomState | null, meta?: RoomStateMeta) => {
+      if (!isCurrentSocket(next, socketGeneration)) return;
+      applyAuthoritativeRoomState(nextRoom, "room:state", meta);
+    });
+    next.on("error:message", ({ message }: { message: string }) => {
+      if (!isCurrentSocket(next, socketGeneration)) return;
+      showError(message);
+    });
     next.on("disconnect", (reason) => {
+      if (!isCurrentSocket(next, socketGeneration)) return;
       setStatus(next.active ? "reconnecting" : "offline");
       setLastError(zhMessage(reason));
     });
-    next.io.on("reconnect_attempt", () => setStatus("reconnecting"));
-    next.io.on("reconnect", () => setStatus("online"));
+    next.io.on("reconnect_attempt", () => {
+      if (!isCurrentSocket(next, socketGeneration)) return;
+      setStatus("reconnecting");
+    });
+    next.io.on("reconnect", () => {
+      if (!isCurrentSocket(next, socketGeneration)) return;
+      setStatus("online");
+    });
     next.on("connect_error", (error) => {
+      if (!isCurrentSocket(next, socketGeneration)) return;
       if (setUpgradeFromSocketError(error)) return;
       setStatus("offline");
       setLastError(zhMessage(error.message));
@@ -435,9 +496,14 @@ export default function App() {
 
   function setUpgradeFromError(error: unknown): boolean {
     if (!(error instanceof UpgradeRequiredError)) return false;
+    sessionGenerationRef.current += 1;
+    socketGenerationRef.current += 1;
+    clearPendingRoomEntry();
     cleanupSocket(socketRef.current);
     socketRef.current = null;
     setSocket(null);
+    tokenRef.current = "";
+    userRef.current = null;
     setUser(null);
     replaceRoomState(null);
     setRooms([]);
@@ -477,24 +543,63 @@ export default function App() {
       requestRoomResume("manual-retry");
       return;
     }
+    if (isRoomEntryEvent(event) && hasActiveRoomEntryContext()) {
+      setLastError("正在进入房间");
+      return;
+    }
+    const requestSessionGeneration = sessionGenerationRef.current;
+    const requestSocketGeneration = socketGenerationRef.current;
     setPendingOps((prev) => ({ ...prev, [key]: true }));
     const request = prepareSocketAction(pendingActions.current, key, event, payload, roomRef.current?.stateVersion, () => `${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}`);
+    const roomEntry = createRoomEntryContext({ event: request.event, payload: request.payload }, requestSessionGeneration, requestSocketGeneration);
+    if (roomEntry) pendingRoomEntryRef.current = roomEntry;
     socket.timeout(6000).emit(request.event, request.payload, (error: Error | null, result?: { ok: boolean; error?: string; message?: string; [key: string]: unknown }) => {
-      if (!mountedRef.current) return;
+      if (!mountedRef.current || !isCurrentSocket(socket, requestSocketGeneration) || requestSessionGeneration !== sessionGenerationRef.current) return;
       setPendingOps((prev) => ({ ...prev, [key]: false }));
       if (error) {
+        clearRoomEntryRequest(key, request);
         setLastError("请求超时，正在同步房间状态");
         requestRoomResume("action-timeout");
         return;
       }
       clearPendingSocketAction(pendingActions.current, key);
       if (!result?.ok) {
+        finishRoomEntryRequest(request);
         if (result?.code === "STATE_VERSION_STALE") requestRoomResume("state-conflict");
         return showError(result?.message ?? result?.error ?? "操作失败");
       }
-      if (Object.prototype.hasOwnProperty.call(result, "state")) applyAuthoritativeRoomState(readAckRoomState(result.state), sourceForEvent(event));
+      if (Object.prototype.hasOwnProperty.call(result, "state")) applyAuthoritativeRoomState(readAckRoomState(result.state), isRoomEntryEvent(event) ? "ack" : sourceForEvent(event));
+      finishRoomEntryRequest(request);
       onOk?.(result);
     });
+  }
+
+  function activeRoomEntryContext(source: RoomStateSource, incoming: RoomState | null, currentRoom: RoomState | null): RoomEntryContext | null {
+    if ((source !== "room:state" && source !== "ack") || currentRoom || incoming === null || !tokenRef.current || !userRef.current) return null;
+    const entry = pendingRoomEntryRef.current;
+    return isRoomEntryContextActive(entry, sessionGenerationRef.current, socketGenerationRef.current) ? entry : null;
+  }
+
+  function hasActiveRoomEntryContext(): boolean {
+    return isRoomEntryContextActive(pendingRoomEntryRef.current, sessionGenerationRef.current, socketGenerationRef.current);
+  }
+
+  function finishRoomEntryRequest(request: { event: string; payload: Record<string, unknown> }): void {
+    const entry = pendingRoomEntryRef.current;
+    if (entry && entry.event === request.event && entry.actionId === request.payload.actionId) clearPendingRoomEntry();
+  }
+
+  function clearRoomEntryRequest(key: string, request: { event: string; payload: Record<string, unknown> }): void {
+    if (isRoomEntryEvent(request.event)) clearPendingSocketAction(pendingActions.current, key);
+    finishRoomEntryRequest(request);
+  }
+
+  function clearPendingRoomEntry(): void {
+    pendingRoomEntryRef.current = null;
+  }
+
+  function isCurrentSocket(candidate: Socket, socketGeneration: number): boolean {
+    return socketRef.current === candidate && socketGenerationRef.current === socketGeneration;
   }
 
   function showError(error: unknown) {
