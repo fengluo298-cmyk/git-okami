@@ -100,7 +100,7 @@ android {
 
     namespace 'com.fengluo298.gitokami'
     defaultConfig {
-        applicationId 'com.fengluo298.gitokami'
+        applicationId 'com.fengluo298.gitokami.next'
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
         versionCode 4

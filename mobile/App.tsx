@@ -659,7 +659,7 @@ export default function App() {
       <SafeAreaView style={styles.screen}>
         <StatusBar barStyle="light-content" />
         <ScrollView contentContainerStyle={styles.connectPanel}>
-          <Text style={styles.title}>德州扑克</Text>
+          <Text style={styles.title}>Git Okami Next</Text>
           <Text style={styles.caption}>仅使用虚拟筹码</Text>
           <ProgressBar label={progressLabel} />
           {canEditServer ? (
@@ -914,7 +914,7 @@ function Header({ user, status, onLogout }: { user: User; status: ConnectionStat
   return (
     <View style={styles.header}>
       <View>
-        <Text style={styles.brand}>德州扑克</Text>
+        <Text style={styles.brand}>Git Okami Next</Text>
         <Text style={styles.subtle}>
           {user.nickname} / 余额 {user.chips}
         </Text>

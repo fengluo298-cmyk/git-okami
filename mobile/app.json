@@ -1,6 +1,6 @@
 {
   "expo": {
-    "name": "德州扑克",
+    "name": "Git Okami Next",
     "slug": "holdem-mvp",
     "version": "1.0.3",
     "orientation": "portrait",
@@ -10,7 +10,7 @@
       "supportsTablet": false
     },
     "android": {
-      "package": "com.fengluo298.gitokami",
+      "package": "com.fengluo298.gitokami.next",
       "versionCode": 4,
       "permissions": []
     },
