@@ -2,7 +2,7 @@
   "expo": {
     "name": "德州扑克",
     "slug": "holdem-mvp",
-    "version": "1.0.2",
+    "version": "1.0.3",
     "orientation": "portrait",
     "userInterfaceStyle": "dark",
     "assetBundlePatterns": [],
@@ -11,7 +11,7 @@
     },
     "android": {
       "package": "com.fengluo298.gitokami",
-      "versionCode": 3,
+      "versionCode": 4,
       "permissions": []
     },
     "plugins": [
