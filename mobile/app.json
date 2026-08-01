@@ -1,6 +1,7 @@
 {
   "expo": {
-    "name": "Git Okami Next",
+    "name": "德州扑克",
+    "icon": "./assets/icon.png",
     "slug": "holdem-mvp",
     "version": "1.0.3",
     "orientation": "portrait",

@@ -100,7 +100,7 @@ type RoomState = {
   };
 };
 type ConnectionStatus = "idle" | "connecting" | "online" | "reconnecting" | "offline";
-type AuthState = "unauthenticated" | "authenticating" | "restoring" | "authenticated" | "offline-authenticated" | "logging-out" | "upgrade-required" | "error";
+type AuthState = "unauthenticated" | "authenticating" | "restoring" | "authenticated" | "logging-out" | "upgrade-required" | "error";
 type ResumeReason = "socket-connect" | "action-timeout" | "app-foreground" | "reconnect" | "manual-retry" | "state-conflict";
 type UpgradeInfo = {
   message: string;
@@ -118,7 +118,7 @@ const productionServerUrl = "https://git-okami.onrender.com";
 const devServerUrl = `http://${["10", "0", "2", "2"].join(".")}:4000`;
 const defaultSocketUrl = process.env.EXPO_PUBLIC_SOCKET_URL || process.env.EXPO_PUBLIC_SERVER_URL || (typeof __DEV__ !== "undefined" && __DEV__ ? devServerUrl : productionServerUrl);
 const defaultApiBase = process.env.EXPO_PUBLIC_API_BASE_URL || process.env.EXPO_PUBLIC_SERVER_URL || (typeof __DEV__ !== "undefined" && __DEV__ ? devServerUrl : productionServerUrl);
-const authTimeoutMs = 45_000;
+const authTimeoutMs = 12_000;
 const errorLimiter = new ErrorLimiter();
 
 export default function App() {
@@ -317,8 +317,18 @@ export default function App() {
         return;
       }
       if (setUpgradeFromError(error)) return;
-      setToken(savedToken);
-      setAuthState("offline-authenticated");
+      try {
+        setToken(savedToken);
+        tokenRef.current = savedToken;
+        connectSocket(savedToken);
+        setAuthState("authenticated");
+      } catch (fallbackError) {
+        tokenRef.current = "";
+        setToken("");
+        setAuthState("unauthenticated");
+        setLastError(zhMessage(errorMessage(fallbackError)));
+        return;
+      }
       setLastError(zhMessage(errorMessage(error)));
     }
   }
@@ -659,7 +669,7 @@ export default function App() {
       <SafeAreaView style={styles.screen}>
         <StatusBar barStyle="light-content" />
         <ScrollView contentContainerStyle={styles.connectPanel}>
-          <Text style={styles.title}>Git Okami Next</Text>
+          <Text style={styles.title}>德州扑克</Text>
           <Text style={styles.caption}>仅使用虚拟筹码</Text>
           <ProgressBar label={progressLabel} />
           {canEditServer ? (
@@ -914,7 +924,7 @@ function Header({ user, status, onLogout }: { user: User; status: ConnectionStat
   return (
     <View style={styles.header}>
       <View>
-        <Text style={styles.brand}>Git Okami Next</Text>
+        <Text style={styles.brand}>德州扑克</Text>
         <Text style={styles.subtle}>
           {user.nickname} / 余额 {user.chips}
         </Text>
