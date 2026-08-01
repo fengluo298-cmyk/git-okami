@@ -21,6 +21,7 @@ const clientDownloadUrl = process.env.CLIENT_DOWNLOAD_URL?.trim() || null;
 const maxJsonBytes = Number(process.env.MAX_JSON_BYTES ?? 16_384);
 const connectionRecoveryMs = 120_000;
 const guestOfflineRoomTtlMs = readNonNegativeInt(process.env.GUEST_OFFLINE_ROOM_TTL_MS, connectionRecoveryMs);
+const guestCookieName = "holdem_guest";
 const trustProxyHops = readTrustProxyHops();
 const voiceEnabled = (process.env.VOICE_PROVIDER ?? "none") !== "none";
 const db = new AppDatabase();
@@ -86,7 +87,10 @@ const httpServer = createServer(async (req, res) => {
     if (req.method === "POST" && url.pathname === "/auth/guest") {
       requireClientBuild(headerClientBuild(req), minClientBuild, clientVersionMeta());
       checkAuthLimit(req, "guest");
-      return sendJson(res, 200, { ok: true, ...guestLogin(db, await readJson(req)) }, requestId);
+      const body = await readJson(req);
+      const session = guestSessionFromCookie(req) ?? guestLogin(db, body);
+      setGuestCookie(res, session.token);
+      return sendJson(res, 200, { ok: true, ...session }, requestId);
     }
     if (req.method === "GET" && url.pathname === "/auth/me") {
       requireClientBuild(headerClientBuild(req), minClientBuild, clientVersionMeta());
@@ -494,6 +498,31 @@ function sendJson(res: ServerResponse, status: number, body: Record<string, unkn
 
 function sendError(res: ServerResponse, requestId: string, error: PublicError): void {
   sendJson(res, error.status, errorPayload(error, requestId), requestId);
+}
+
+function guestSessionFromCookie(req: IncomingMessage): { user: UserRecord; token: string } | null {
+  const token = cookieValue(req, guestCookieName);
+  if (!token) return null;
+  try {
+    const user = verifyToken(db, token);
+    return user.username === null ? { user, token } : null;
+  } catch {
+    return null;
+  }
+}
+
+function setGuestCookie(res: ServerResponse, token: string): void {
+  res.setHeader("set-cookie", `${guestCookieName}=${token}; Max-Age=2592000; Path=/; HttpOnly; Secure; SameSite=Lax`);
+}
+
+function cookieValue(req: IncomingMessage, name: string): string | null {
+  const cookie = req.headers.cookie;
+  if (typeof cookie !== "string") return null;
+  for (const part of cookie.split(";")) {
+    const [key, value] = part.trim().split("=");
+    if (key === name && value) return value;
+  }
+  return null;
 }
 
 function setCors(req: IncomingMessage, res: ServerResponse): void {

@@ -268,6 +268,23 @@ test("upgrade and health endpoints expose version state without requiring a clie
   }
 });
 
+test("guest auth cookie reuses the guest account when local token storage is unavailable", async () => {
+  const server = await startServer();
+  try {
+    const first = await request(server.port, "POST", "/auth/guest", {}, "3");
+    assert.equal(first.status, 200);
+    const cookie = first.headers.get("set-cookie");
+    assert.match(cookie ?? "", /holdem_guest=/);
+
+    const second = await request(server.port, "POST", "/auth/guest", {}, "3", { cookie: cookie!.split(";")[0] });
+    assert.equal(second.status, 200);
+    assert.equal(second.body.user.id, first.body.user.id);
+    assert.equal(second.body.token, first.body.token);
+  } finally {
+    await server.close();
+  }
+});
+
 test("explicit minimum client build can require a future app build", async () => {
   const server = await startServer({ MIN_CLIENT_BUILD: "4" });
   try {
@@ -688,7 +705,7 @@ async function register(port: number, username: string, clientBuild = "3"): Prom
   return response.body;
 }
 
-async function request(port: number, method: string, path: string, body?: Json, clientBuild?: string, headers: Record<string, string> = {}): Promise<{ status: number; body: Json }> {
+async function request(port: number, method: string, path: string, body?: Json, clientBuild?: string, headers: Record<string, string> = {}): Promise<{ status: number; body: Json; headers: Headers }> {
   const response = await fetch(`http://127.0.0.1:${port}${path}`, {
     method,
     headers: {
@@ -698,7 +715,7 @@ async function request(port: number, method: string, path: string, body?: Json, 
     },
     body: body ? JSON.stringify(body) : undefined
   });
-  return { status: response.status, body: await response.json() as Json };
+  return { status: response.status, body: await response.json() as Json, headers: response.headers };
 }
 
 async function connectPlayer(port: number, token: string, clientBuild = 3): Promise<ClientSocket> {
