@@ -262,6 +262,15 @@ export class RoomStore {
     return seatChanged || engineChanged ? this.touch(room) : room;
   }
 
+  cleanupOfflineGuest(user: UserRecord): Room | null {
+    if (user.username !== null) return null;
+    const room = this.currentRoom(user.id);
+    if (!room || room.status === "playing") return null;
+    const seat = room.seats.find((candidate) => candidate?.id === user.id);
+    if (seat?.connected) return null;
+    return this.leaveRoom(user.id);
+  }
+
   currentRoom(userId: string): Room | null {
     const roomId = this.userRoom.get(userId);
     return roomId ? this.rooms.get(roomId) ?? null : null;

@@ -19,6 +19,8 @@ const minClientBuild = readMinimumClientBuild();
 const latestClientVersion = process.env.LATEST_CLIENT_VERSION ?? "1.0.2";
 const clientDownloadUrl = process.env.CLIENT_DOWNLOAD_URL?.trim() || null;
 const maxJsonBytes = Number(process.env.MAX_JSON_BYTES ?? 16_384);
+const connectionRecoveryMs = 120_000;
+const guestOfflineRoomTtlMs = readNonNegativeInt(process.env.GUEST_OFFLINE_ROOM_TTL_MS, connectionRecoveryMs);
 const trustProxyHops = readTrustProxyHops();
 const voiceEnabled = (process.env.VOICE_PROVIDER ?? "none") !== "none";
 const db = new AppDatabase();
@@ -34,6 +36,7 @@ const runtimeLeaseHeartbeat = setInterval(() => {
 runtimeLeaseHeartbeat.unref();
 const rooms = new RoomStore(db);
 const actionTimers = new Map<string, NodeJS.Timeout>();
+const guestCleanupTimers = new Map<string, NodeJS.Timeout>();
 const userSockets = new SocketPresence();
 const operations = new OperationDeduper();
 const authLimiter = createRateLimiter(20, 15 * 60_000, { maxKeys: 10_000 });
@@ -100,7 +103,7 @@ const httpServer = createServer(async (req, res) => {
 const io = new Server(httpServer, {
   cors: { origin: socketCorsOrigins },
   connectionStateRecovery: {
-    maxDisconnectionDuration: 120_000
+    maxDisconnectionDuration: connectionRecoveryMs
   }
 });
 
@@ -120,9 +123,11 @@ io.use((socket, next) => {
 });
 
 io.on("connection", (socket: Socket) => {
-  const userId = currentSocketUser(socket).id;
+  const user = currentSocketUser(socket);
+  const userId = user.id;
+  cancelGuestRoomCleanup(userId);
   userSockets.add(userId, socket.id);
-  socket.emit("session", currentSocketUser(socket));
+  socket.emit("session", user);
   socket.emit("rooms:list", rooms.listRooms());
 
   socket.on("rooms:list", () => socket.emit("rooms:list", rooms.listRooms()));
@@ -264,7 +269,11 @@ io.on("connection", (socket: Socket) => {
   socket.on("disconnect", () => {
     userSockets.remove(userId, socket.id);
     if (userSockets.has(userId)) return;
-    void markDisconnected(userId).catch((error) => logSocketTaskError("disconnect", error));
+    void markDisconnected(userId)
+      .then(() => {
+        if (user.username === null) scheduleGuestRoomCleanup(userId);
+      })
+      .catch((error) => logSocketTaskError("disconnect", error));
   });
 });
 
@@ -370,6 +379,38 @@ async function markDisconnected(userId: string): Promise<void> {
   });
 }
 
+function scheduleGuestRoomCleanup(userId: string): void {
+  if (guestCleanupTimers.has(userId)) return;
+  const timer = setTimeout(() => {
+    guestCleanupTimers.delete(userId);
+    void cleanupGuestRoom(userId).catch((error) => logSocketTaskError("guestRoomCleanup", error));
+  }, guestOfflineRoomTtlMs);
+  timer.unref();
+  guestCleanupTimers.set(userId, timer);
+}
+
+function cancelGuestRoomCleanup(userId: string): void {
+  const timer = guestCleanupTimers.get(userId);
+  if (!timer) return;
+  clearTimeout(timer);
+  guestCleanupTimers.delete(userId);
+}
+
+async function cleanupGuestRoom(userId: string): Promise<void> {
+  if (userSockets.has(userId)) return;
+  const user = db.getUser(userId);
+  if (!user) return;
+  const current = rooms.currentRoom(userId);
+  if (!current) return;
+  await roomLocks.run(current.id, () => {
+    if (userSockets.has(userId)) return;
+    const room = rooms.cleanupOfflineGuest(user);
+    if (!room) return;
+    emitRooms();
+    if (rooms.roomById(room.id)) emitRoom(room);
+  });
+}
+
 function scheduleRoomTimer(room: Room): void {
   const oldTimer = actionTimers.get(room.id);
   if (oldTimer) clearTimeout(oldTimer);
@@ -397,6 +438,8 @@ function cleanupRuntime(): void {
   clearInterval(runtimeLeaseHeartbeat);
   for (const timer of actionTimers.values()) clearTimeout(timer);
   actionTimers.clear();
+  for (const timer of guestCleanupTimers.values()) clearTimeout(timer);
+  guestCleanupTimers.clear();
   db.releaseRuntimeLease(runtimeLeaseOwnerId);
 }
 
@@ -599,6 +642,13 @@ function readTrustProxyHops(): number {
   if (raw === undefined || raw.trim() === "") return 0;
   const value = Number(raw);
   if (!Number.isSafeInteger(value) || value < 0 || value > 10) throw new Error("TRUST_PROXY_HOPS must be a safe integer from 0 to 10");
+  return value;
+}
+
+function readNonNegativeInt(raw: string | undefined, fallback: number): number {
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < 0) throw new Error("GUEST_OFFLINE_ROOM_TTL_MS must be a safe non-negative integer");
   return value;
 }
 

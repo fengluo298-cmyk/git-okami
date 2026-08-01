@@ -77,6 +77,56 @@ test("playing rooms reject create join and leave without mutating membership or 
   assert.equal(db.getUser(users[0].id)?.chips, 9000);
 });
 
+test("offline guest cleanup cashes out and removes idle empty rooms", () => {
+  const db = new AppDatabase(join(tmpdir(), `holdem-${randomUUID()}.db`));
+  const store = new RoomStore(db);
+  const guest = db.getOrCreateGuest(undefined, "Idle");
+  const room = store.createRoom(guest, "idle", { minBuyIn: 1000, maxBuyIn: 1000 });
+
+  store.sit(guest, 0, 1000);
+  assert.equal(db.getUser(guest.id)?.chips, 9000);
+  store.markConnected(guest.id, false);
+  const cleaned = store.cleanupOfflineGuest(guest);
+
+  assert.equal(cleaned?.id, room.id);
+  assert.equal(store.currentRoom(guest.id), null);
+  assert.equal(store.listRooms().length, 0);
+  assert.equal(db.getUser(guest.id)?.chips, 10000);
+  db.close();
+});
+
+test("offline guest cleanup skips connected guests, registered users, and active hands", () => {
+  const db = new AppDatabase(join(tmpdir(), `holdem-${randomUUID()}.db`));
+  const store = new RoomStore(db);
+  const connectedGuest = db.getOrCreateGuest(undefined, "Online");
+  const registered = db.createUser("registered_cleanup", "hash", "Registered");
+  const players = [0, 1].map((index) => db.getOrCreateGuest(undefined, `Live${index}`));
+  const connectedRoom = store.createRoom(connectedGuest, "connected");
+
+  store.sit(connectedGuest, 0, 1000);
+  assert.equal(store.cleanupOfflineGuest(connectedGuest), null);
+  assert.equal(store.currentRoom(connectedGuest.id)?.id, connectedRoom.id);
+
+  const registeredRoom = store.createRoom(registered, "registered");
+  store.sit(registered, 0, 1000);
+  store.markConnected(registered.id, false);
+  assert.equal(store.cleanupOfflineGuest(registered), null);
+  assert.equal(store.currentRoom(registered.id)?.id, registeredRoom.id);
+
+  const playingRoom = store.createRoom(players[0], "playing", { minBuyIn: 1000, maxBuyIn: 1000 });
+  store.joinRoom(players[1], playingRoom.id);
+  players.forEach((player, seat) => {
+    store.sit(player, seat, 1000);
+    store.setReady(player.id, true);
+  });
+  store.startGame(players[0].id);
+  store.markConnected(players[0].id, false);
+  assert.equal(store.cleanupOfflineGuest(players[0]), null);
+  assert.equal(store.currentRoom(players[0].id)?.id, playingRoom.id);
+  assert.equal(db.getUser(players[0].id)?.chips, 9000);
+  db.close();
+});
+
 test("room state version increments and rejects stale actions", () => {
   const db = new AppDatabase(join(tmpdir(), `holdem-${randomUUID()}.db`));
   const store = new RoomStore(db);
