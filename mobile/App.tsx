@@ -14,7 +14,7 @@ import {
   View
 } from "react-native";
 import { io, type Socket } from "socket.io-client";
-import { apiRequest, AuthExpiredError, InvalidResponseError, NetworkError, ServerError, TimeoutError, UpgradeRequiredError, validateDownloadUrl, validateHttpBaseUrl, validateSocketUrl } from "./src/api/client";
+import { apiRequest, AuthExpiredError, InvalidResponseError, isTransientNetworkError, NetworkError, ServerError, TimeoutError, UpgradeRequiredError, validateDownloadUrl, validateHttpBaseUrl, validateSocketUrl } from "./src/api/client";
 import { tokenStorage } from "./src/auth/tokenStorage";
 import { CardView } from "./src/components/CardView";
 import { ProgressBar } from "./src/components/ProgressBar";
@@ -329,7 +329,8 @@ export default function App() {
         setLastError(zhMessage(errorMessage(fallbackError)));
         return;
       }
-      setLastError(zhMessage(errorMessage(error)));
+      if (isTransientNetworkError(error)) setLastError("");
+      else setLastError(zhMessage(errorMessage(error)));
     }
   }
 

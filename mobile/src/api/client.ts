@@ -28,6 +28,10 @@ export type ApiOptions = {
   fetchImpl?: typeof fetch;
 };
 
+export function isTransientNetworkError(error: unknown): boolean {
+  return error instanceof NetworkError || error instanceof TimeoutError;
+}
+
 const allowedHosts = new Set((process.env.EXPO_PUBLIC_ALLOWED_HOSTS || "git-okami.onrender.com").split(",").map((host: string) => host.trim()).filter(Boolean));
 const allowedDownloadHosts = new Set(
   (process.env.EXPO_PUBLIC_ALLOWED_DOWNLOAD_HOSTS || "git-okami.onrender.com,github.com,github-releases.githubusercontent.com,objects.githubusercontent.com")

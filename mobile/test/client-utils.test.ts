@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { apiRequest, AuthExpiredError, InvalidResponseError, NetworkError, ServerError, TimeoutError, UpgradeRequiredError, validateDownloadUrl, validateHttpBaseUrl, validateSocketUrl } from "../src/api/client";
+import { apiRequest, AuthExpiredError, InvalidResponseError, isTransientNetworkError, NetworkError, ServerError, TimeoutError, UpgradeRequiredError, validateDownloadUrl, validateHttpBaseUrl, validateSocketUrl } from "../src/api/client";
 import { clearStoredToken, isValidTokenShape, legacyTokenKey, readStoredToken, secureTokenKey } from "../src/auth/tokenCore";
 import { parseChipAmount, parseChipAmountInRange } from "../src/utils/amount";
 import { ErrorLimiter } from "../src/utils/errorLimiter";
@@ -70,6 +70,12 @@ test("api client handles aborts and thrown values without DOMException", async (
     await assert.rejects(() => apiRequest("https://git-okami.onrender.com", "/me", { fetchImpl: throws(new Error("Property DOMException doesn't exist")) }), NetworkError);
     await assert.rejects(() => apiRequest("https://git-okami.onrender.com", "/me", { fetchImpl: throws("boom") }), NetworkError);
   });
+});
+
+test("restore session can suppress transient network failures", () => {
+  assert.equal(isTransientNetworkError(new NetworkError("offline")), true);
+  assert.equal(isTransientNetworkError(new TimeoutError("slow")), true);
+  assert.equal(isTransientNetworkError(new AuthExpiredError("expired")), false);
 });
 
 test("api client hides internal server error text", async () => {
