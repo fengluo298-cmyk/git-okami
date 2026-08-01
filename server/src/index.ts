@@ -21,7 +21,7 @@ const clientDownloadUrl = process.env.CLIENT_DOWNLOAD_URL?.trim() || null;
 const maxJsonBytes = Number(process.env.MAX_JSON_BYTES ?? 16_384);
 const connectionRecoveryMs = 120_000;
 const guestOfflineRoomTtlMs = readNonNegativeInt(process.env.GUEST_OFFLINE_ROOM_TTL_MS, connectionRecoveryMs);
-const guestCookieName = "holdem_guest";
+const authCookieName = "holdem_guest";
 const trustProxyHops = readTrustProxyHops();
 const voiceEnabled = (process.env.VOICE_PROVIDER ?? "none") !== "none";
 const db = new AppDatabase();
@@ -76,20 +76,24 @@ const httpServer = createServer(async (req, res) => {
       requireClientBuild(headerClientBuild(req), minClientBuild, clientVersionMeta());
       const body = await readJson(req);
       checkAuthLimit(req, body.username);
-      return sendJson(res, 200, { ok: true, ...(await register(db, body)) }, requestId);
+      const session = await register(db, body);
+      setAuthCookie(res, session.token);
+      return sendJson(res, 200, { ok: true, ...session }, requestId);
     }
     if (req.method === "POST" && url.pathname === "/auth/login") {
       requireClientBuild(headerClientBuild(req), minClientBuild, clientVersionMeta());
       const body = await readJson(req);
       checkAuthLimit(req, body.username);
-      return sendJson(res, 200, { ok: true, ...(await login(db, body)) }, requestId);
+      const session = await login(db, body);
+      setAuthCookie(res, session.token);
+      return sendJson(res, 200, { ok: true, ...session }, requestId);
     }
     if (req.method === "POST" && url.pathname === "/auth/guest") {
       requireClientBuild(headerClientBuild(req), minClientBuild, clientVersionMeta());
       checkAuthLimit(req, "guest");
       const body = await readJson(req);
-      const session = guestSessionFromCookie(req) ?? guestLogin(db, body);
-      setGuestCookie(res, session.token);
+      const session = authSessionFromCookie(req) ?? guestLogin(db, body);
+      setAuthCookie(res, session.token);
       return sendJson(res, 200, { ok: true, ...session }, requestId);
     }
     if (req.method === "GET" && url.pathname === "/auth/me") {
@@ -500,19 +504,19 @@ function sendError(res: ServerResponse, requestId: string, error: PublicError): 
   sendJson(res, error.status, errorPayload(error, requestId), requestId);
 }
 
-function guestSessionFromCookie(req: IncomingMessage): { user: UserRecord; token: string } | null {
-  const token = cookieValue(req, guestCookieName);
+function authSessionFromCookie(req: IncomingMessage): { user: UserRecord; token: string } | null {
+  const token = cookieValue(req, authCookieName);
   if (!token) return null;
   try {
     const user = verifyToken(db, token);
-    return user.username === null ? { user, token } : null;
+    return { user, token };
   } catch {
     return null;
   }
 }
 
-function setGuestCookie(res: ServerResponse, token: string): void {
-  res.setHeader("set-cookie", `${guestCookieName}=${token}; Max-Age=2592000; Path=/; HttpOnly; Secure; SameSite=Lax`);
+function setAuthCookie(res: ServerResponse, token: string): void {
+  res.setHeader("set-cookie", `${authCookieName}=${token}; Max-Age=2592000; Path=/; HttpOnly; Secure; SameSite=Lax`);
 }
 
 function cookieValue(req: IncomingMessage, name: string): string | null {

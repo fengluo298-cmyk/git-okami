@@ -285,6 +285,28 @@ test("guest auth cookie reuses the guest account when local token storage is una
   }
 });
 
+test("registered auth cookie can recover through guest entry when local token storage is unavailable", async () => {
+  const server = await startServer();
+  try {
+    const registered = await request(server.port, "POST", "/auth/register", { username: "cookie_registered", password: "secret1", nickname: "Cookie" }, "3");
+    assert.equal(registered.status, 200);
+    assert.match(registered.headers.get("set-cookie") ?? "", /holdem_guest=/);
+
+    const loggedIn = await request(server.port, "POST", "/auth/login", { username: "cookie_registered", password: "secret1" }, "3");
+    assert.equal(loggedIn.status, 200);
+    const cookie = loggedIn.headers.get("set-cookie");
+    assert.match(cookie ?? "", /holdem_guest=/);
+
+    const recovered = await request(server.port, "POST", "/auth/guest", {}, "3", { cookie: cookie!.split(";")[0] });
+    assert.equal(recovered.status, 200);
+    assert.equal(recovered.body.user.id, registered.body.user.id);
+    assert.equal(recovered.body.user.username, "cookie_registered");
+    assert.equal(recovered.body.token, loggedIn.body.token);
+  } finally {
+    await server.close();
+  }
+});
+
 test("explicit minimum client build can require a future app build", async () => {
   const server = await startServer({ MIN_CLIENT_BUILD: "4" });
   try {
