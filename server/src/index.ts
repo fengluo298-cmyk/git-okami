@@ -98,7 +98,9 @@ const httpServer = createServer(async (req, res) => {
     }
     if (req.method === "GET" && url.pathname === "/auth/me") {
       requireClientBuild(headerClientBuild(req), minClientBuild, clientVersionMeta());
-      return sendJson(res, 200, { ok: true, user: verifyToken(db, bearer(req)) }, requestId);
+      const session = requireAuthSession(req);
+      setAuthCookie(res, session.token);
+      return sendJson(res, 200, { ok: true, ...session }, requestId);
     }
     return sendError(res, requestId, apiError("NOT_FOUND", "未找到", 404));
   } catch (error) {
@@ -119,7 +121,7 @@ io.use((socket, next) => {
   try {
     const auth = socket.handshake.auth as { token?: string; clientBuild?: number };
     requireClientBuild(auth.clientBuild, minClientBuild, clientVersionMeta());
-    socket.data.user = verifyToken(db, auth.token);
+    socket.data.user = requireAuthSession(socket.request, auth.token).user;
     next();
   } catch (error) {
     const requestId = randomUUID();
@@ -502,6 +504,19 @@ function sendJson(res: ServerResponse, status: number, body: Record<string, unkn
 
 function sendError(res: ServerResponse, requestId: string, error: PublicError): void {
   sendJson(res, error.status, errorPayload(error, requestId), requestId);
+}
+
+function requireAuthSession(req: IncomingMessage, token = bearer(req)): { user: UserRecord; token: string } {
+  try {
+    if (token) return { user: verifyToken(db, token), token };
+  } catch {
+    const session = authSessionFromCookie(req);
+    if (session) return session;
+    throw new Error("Invalid token");
+  }
+  const session = authSessionFromCookie(req);
+  if (session) return session;
+  throw new Error("Missing token");
 }
 
 function authSessionFromCookie(req: IncomingMessage): { user: UserRecord; token: string } | null {

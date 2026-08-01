@@ -287,6 +287,7 @@ test("guest auth cookie reuses the guest account when local token storage is una
 
 test("registered auth cookie can recover through guest entry when local token storage is unavailable", async () => {
   const server = await startServer();
+  const sockets: ClientSocket[] = [];
   try {
     const registered = await request(server.port, "POST", "/auth/register", { username: "cookie_registered", password: "secret1", nickname: "Cookie" }, "3");
     assert.equal(registered.status, 200);
@@ -302,7 +303,24 @@ test("registered auth cookie can recover through guest entry when local token st
     assert.equal(recovered.body.user.id, registered.body.user.id);
     assert.equal(recovered.body.user.username, "cookie_registered");
     assert.equal(recovered.body.token, loggedIn.body.token);
+
+    const restored = await request(server.port, "GET", "/auth/me", undefined, "3", { authorization: "Bearer bad.bad.bad", cookie: cookie!.split(";")[0] });
+    assert.equal(restored.status, 200);
+    assert.equal(restored.body.user.id, registered.body.user.id);
+
+    const socket = connectSocket(`http://127.0.0.1:${server.port}`, {
+      auth: { token: "bad.bad.bad", clientBuild: 3 },
+      autoConnect: false,
+      reconnection: false,
+      timeout: 2000,
+      transports: ["websocket"],
+      extraHeaders: { cookie: cookie!.split(";")[0] }
+    });
+    sockets.push(socket);
+    await connectPreparedSocket(socket);
+    assert.equal(socket.connected, true);
   } finally {
+    for (const socket of sockets) socket.disconnect();
     await server.close();
   }
 });
