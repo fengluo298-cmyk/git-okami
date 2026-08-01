@@ -141,6 +141,26 @@ android {
     }
 }
 
+gradle.projectsEvaluated {
+    def asyncStorageClean = rootProject.tasks.findByPath(":react-native-async-storage_async-storage:clean")
+    def asyncStorageCodegen = rootProject.tasks.findByPath(":react-native-async-storage_async-storage:generateCodegenArtifactsFromSchema")
+
+    if (asyncStorageCodegen != null) {
+        if (asyncStorageClean != null) {
+            asyncStorageCodegen.mustRunAfter(asyncStorageClean)
+        }
+
+        // RN native clean reads dependency codegen before assemble can recreate it.
+        tasks.matching { it.name in [
+            "externalNativeBuildCleanDebug",
+            "externalNativeBuildCleanDebugOptimized",
+            "externalNativeBuildCleanRelease"
+        ] }.configureEach {
+            dependsOn(asyncStorageCodegen)
+        }
+    }
+}
+
 // Apply static values from `gradle.properties` to the `android.packagingOptions`
 // Accepts values in comma delimited lists, example:
 // android.packagingOptions.pickFirsts=/LICENSE,**/picasa.ini
